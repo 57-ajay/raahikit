@@ -9,6 +9,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 load_dotenv(".env.local")
 logger = logging.getLogger("cab-agent")
 
+
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
@@ -38,12 +39,15 @@ class Assistant(Agent):
             trip_type: The type of trip, either 'one-way' or 'round-trip'.
         """
         # In a real app, we would save this to your database here.
-        logger.info(f"Creating trip: {origin} -> {destination} on {date} ({trip_type})")
+        logger.info(
+            f"Creating trip: {origin} -> {destination} on {date} ({trip_type})")
 
         # The return value is spoken back to the user or used by the LLM to generate a confirmation
         return f"Success! I have booked a {trip_type} cab from {origin} to {destination} for {date}. Your driver will arrive shortly."
 
+
 server = AgentServer()
+
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
@@ -72,6 +76,7 @@ async def my_agent(ctx: agents.JobContext):
     await session.generate_reply(
         instructions="Greet the user and ask where they would like to go today."
     )
+
 
 if __name__ == "__main__":
     agents.cli.run_app(server)

@@ -1,0 +1,61 @@
+services:
+  # --- 1. SSL Proxy (Caddy) ---
+  caddy:
+    image: caddy:latest
+    restart: unless-stopped
+    command: caddy reverse-proxy --from ${DOMAIN_NAME} --to livekit:7880
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - DOMAIN_NAME=${DOMAIN_NAME}
+
+  # --- 2. LiveKit Server ---
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: --config /livekit.yaml
+    volumes:
+      - ./livekit-config/livekit.yaml:/livekit.yaml
+    ports:
+      - "7881:7881"
+      - "7882:7882/udp"
+    depends_on:
+      - redis
+    environment:
+      - LIVEKIT_IP=${PUBLIC_IP}
+
+  # --- 3. Redis ---
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+
+  # --- 4. AI Agent ---
+  agent:
+    build: .
+    restart: always
+    environment:
+      # Connect locally to LiveKit container
+      - LIVEKIT_URL=ws://livekit:7880
+      # INJECT KEYS FROM .ENV
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+    depends_on:
+      - livekit
+
+  # --- 5. Token Server ---
+  token-server:
+    build: .
+    command: uv run uvicorn server:app --host 0.0.0.0 --port 3000
+    ports:
+      - "3000:3000"
+    environment:
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+
+volumes:
+  caddy_data:
+  caddy_config:
