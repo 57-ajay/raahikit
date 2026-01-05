@@ -15,11 +15,11 @@ from livekit.agents import (
 from livekit.plugins import (
     google,
     silero,
-    turn_detector,
     noise_cancellation,
 )
 
-load_dotenv(".env")
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+load_dotenv(".env.local")
 logger = logging.getLogger("cab-agent")
 
 
@@ -68,27 +68,27 @@ async def my_agent(ctx: agents.JobContext):
         stt=google.STT(
             languages="hi-IN",
             model="chirp",
-            location="India",
-            recognition_config={
-                "language_codes": ["hi-IN"],
-            },
         ),
 
         # Gemini (fast + cheap, perfect for voice agents)
         llm=google.LLM(
-            model="gemini-2.5-flash-lite",
+            model="gemini-3-flash-preview",
+            vertexai=True,
+            project="cabswale-ai",
+            location="us-central1",
         ),
 
         # Google Cloud TTS
         tts=google.TTS(
-            voice_name="hi-IN-Neural2-A",
+            gender="female",
+            voice_name="hi-IN-Chirp3-HD-Aoede",
         ),
 
         # VAD
         vad=silero.VAD.load(),
 
         # NEW turn detection API
-        turn_detection=turn_detector.multilingual.MultilingualModel(),
+        turn_detection=MultilingualModel(),
     )
 
     await session.start(
