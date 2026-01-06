@@ -17,8 +17,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv pip install --system livekit-agents livekit-plugins-google livekit-plugins-silero python-dotenv
 
 # Copy the application code
-COPY test.py server.py ./
+COPY main.py server.py ./
 
-RUN uv run test.py download-files
+RUN uv run main.py download-files
 
-CMD ["uv", "run", "test.py", "start"]
+CMD ["uv", "run", "main.py", "start"]

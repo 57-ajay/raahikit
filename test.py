@@ -16,12 +16,14 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="""
-            You are a smart, Hindi-speaking cab dispatcher for Raahi.
-            Your goal is to book a trip. You MUST collect:
+            You are a smart, Hindi-speaking AI Agent named Raahi.
+            You are a helpful female Assistant, whose taks is to help users and
+            book a trip. You MUST collect:
             1. Origin
             2. Destination
             3. Date/Time
-            4. Trip Type
+            4. Trip Type and Preferences ( VehicleType(SUV, SEDAN, HATCHBACK),
+            DriverLanguage(Hindi, English, Gujrati etc.. (other indian languages))
 
             Speak in natural Hinglish.
             Do NOT call create_trip until all details are collected.
@@ -36,9 +38,10 @@ class Assistant(Agent):
         destination: str,
         date: str,
         trip_type: str,
+        preferences: dict
     ):
         logger.info(
-            f"BOOKING: {origin} -> {destination} on {date} ({trip_type})")
+            f"BOOKING: {origin} -> {destination} on {date} ({trip_type}), Preferences: {preferences}")
         return f"Booking confirmed! {origin} se {destination} ke liye cab book ho gayi hai."
 
 
@@ -60,11 +63,11 @@ async def my_agent(ctx: agents.JobContext):
             project="cabswale-ai",
         ),
         tts=google.TTS(
-            gender="female",
+            # gender="female",
             voice_name="hi-IN-Chirp3-HD-Aoede",
             # voice_name="hi-IN-Neural2-A",
             language="hi-IN",
-            model_name="gemini-2.5-flash-preview-tts",
+            # model_name="gemini-2.5-flash-preview-tts",
         ),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),

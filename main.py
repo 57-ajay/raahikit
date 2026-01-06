@@ -1,49 +1,48 @@
-import logging
 from dotenv import load_dotenv
+import logging
 
 from livekit import agents, rtc
-from livekit.agents import AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
-from livekit.plugins import noise_cancellation, silero
+from livekit.agents import (
+    AgentServer, AgentSession, Agent, room_io, function_tool, RunContext)
+from livekit.plugins import google, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-load_dotenv(".env.local")
-logger = logging.getLogger("cab-agent")
+load_dotenv(".env")
+
+logger = logging.getLogger("test-agent")
 
 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a helpful cab booking assistant for LiveCab.
-            Your goal is to book a trip for the user.
-            You must collect the following 4 pieces of information:
-            1. Origin (Pickup location)
-            2. Destination (Dropoff location)
-            3. Date/Time of trip
-            4. Trip Type (One-way or Round-trip)
+            instructions="""
+            You are a smart, Hindi-speaking AI Agent named Raahi.
+            You are a helpful female Assistant, whose taks is to help users and
+            book a trip. You MUST collect:
+            1. Origin
+            2. Destination
+            3. Date/Time
+            4. Trip Type and Preferences ( VehicleType(SUV, SEDAN, HATCHBACK),
+            DriverLanguage(Hindi, English, Gujrati etc.. (other indian languages))
 
-            Do not call the booking tool until you have ALL 4 pieces of information.
-            If information is missing, ask the user specifically for that missing piece.
-            Once you have all details, immediately call the 'create_trip' function.
+            Speak in natural Hinglish.
+            Do NOT call create_trip until all details are collected.
             """,
         )
 
     @function_tool
-    async def create_trip(self, ctx: RunContext, origin: str, destination: str, date: str, trip_type: str):
-        """
-        Creates a cab trip booking. Call this ONLY when you have collected all necessary details.
-
-        Args:
-            origin: The pickup location (city or address).
-            destination: The dropoff location.
-            date: The date and time of the trip (e.g., "tomorrow at 5pm").
-            trip_type: The type of trip, either 'one-way' or 'round-trip'.
-        """
-        # In a real app, we would save this to your database here.
+    async def create_trip(
+        self,
+        ctx: RunContext,
+        origin: str,
+        destination: str,
+        date: str,
+        trip_type: str,
+        preferences: dict
+    ):
         logger.info(
-            f"Creating trip: {origin} -> {destination} on {date} ({trip_type})")
-
-        # The return value is spoken back to the user or used by the LLM to generate a confirmation
-        return f"Success! I have booked a {trip_type} cab from {origin} to {destination} for {date}. Your driver will arrive shortly."
+            f"BOOKING: {origin} -> {destination} on {date} ({trip_type}), Preferences: {preferences}")
+        return f"Booking confirmed! {origin} se {destination} ke liye cab book ho gayi hai."
 
 
 server = AgentServer()
@@ -51,12 +50,25 @@ server = AgentServer()
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
-    logger.info(f"Connecting to room: {ctx.room.name}")
-
     session = AgentSession(
-        stt="assemblyai/universal-streaming:en",
-        llm="openai/gpt-4.1-mini",
-        tts="cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        stt=google.STT(
+            model="telephony",
+            languages="hi-IN",
+            # location="asia-south1",
+        ),
+        llm=google.LLM(
+            model="gemini-2.5-flash",
+            vertexai=True,
+            location="us-central1",
+            project="cabswale-ai",
+        ),
+        tts=google.TTS(
+            # gender="female",
+            voice_name="hi-IN-Chirp3-HD-Aoede",
+            # voice_name="hi-IN-Neural2-A",
+            language="hi-IN",
+            # model_name="gemini-2.5-flash-preview-tts",
+        ),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
     )
@@ -66,15 +78,14 @@ async def my_agent(ctx: agents.JobContext):
         agent=Assistant(),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: noise_cancellation.BVCTelephony()
-                if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                else noise_cancellation.BVC(),
+                noise_cancellation=lambda params: noise_cancellation.BVCTelephony(
+                ) if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP else noise_cancellation.BVC(),
             ),
         ),
     )
 
     await session.generate_reply(
-        instructions="Greet the user and ask where they would like to go today."
+        instructions="Greet the user and offer your assistance.",
     )
 
 
