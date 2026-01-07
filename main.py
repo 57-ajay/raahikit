@@ -1,48 +1,91 @@
-from dotenv import load_dotenv
 import logging
+import json
+from typing import Optional
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 from livekit import agents, rtc
 from livekit.agents import (
-    AgentServer, AgentSession, Agent, room_io, function_tool, RunContext)
-from livekit.plugins import google, noise_cancellation, silero
+    AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
+)
+from livekit.plugins import google, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+try:
+    from raahikit.prompt import PROMPT
+except ImportError:
+    from prompt import PROMPT
 
 load_dotenv(".env")
 
-logger = logging.getLogger("test-agent")
+logger = logging.getLogger("raahi-agent")
 
 
 class Assistant(Agent):
-    def __init__(self) -> None:
+    def __init__(self, room: rtc.Room) -> None:
+        self.room = room
+        formatted_prompt = PROMPT.format(
+            current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M")
+        )
         super().__init__(
-            instructions="""
-            You are a smart, Hindi-speaking AI Agent named Raahi.
-            You are a helpful female Assistant, whose taks is to help users and
-            book a trip. You MUST collect:
-            1. Origin
-            2. Destination
-            3. Date/Time
-            4. Trip Type and Preferences ( VehicleType(SUV, SEDAN, HATCHBACK),
-            DriverLanguage(Hindi, English, Gujrati etc.. (other indian languages))
-
-            Speak in natural Hinglish.
-            Do NOT call create_trip until all details are collected.
-            """,
+            instructions=formatted_prompt,
         )
 
     @function_tool
-    async def create_trip(
+    async def update_trip(
         self,
         ctx: RunContext,
-        origin: str,
-        destination: str,
-        date: str,
-        trip_type: str,
-        preferences: dict
+        origin: Optional[str] = None,
+        destination: Optional[str] = None,
+        start_date: Optional[str] = None,
+        trip_type: Optional[str] = None,
+        preferences: Optional[dict] = None,
+        return_date: Optional[str] = None,
     ):
-        logger.info(
-            f"BOOKING: {origin} -> {destination} on {date} ({trip_type}), Preferences: {preferences}")
-        return f"Booking confirmed! {origin} se {destination} ke liye cab book ho gayi hai."
+        """
+        Updates the trip details on the user's screen in real-time.
+        Call this tool whenever the user provides new information.
+
+        Args:
+            origin: Pickup location.
+            destination: Drop-off location.
+            start_date: ISO 8601 string for the trip start.
+            trip_type: 'one_way' or 'round_trip'.
+            preferences: Dictionary containing vehicle_type and driver_language.
+            return_date: ISO 8601 string for return trip.
+        """
+
+        final_return_date = return_date
+        if trip_type == "one_way" and start_date and not final_return_date:
+            try:
+                start_dt = datetime.fromisoformat(start_date)
+                return_dt = start_dt + timedelta(hours=12)
+                final_return_date = return_dt.isoformat()
+            except ValueError:
+                pass
+
+        trip_data = {
+            "event": "trip_update",
+            "details": {
+                "origin": origin,
+                "destination": destination,
+                "start_date": start_date,
+                "return_date": final_return_date,
+                "trip_type": trip_type,
+                "preferences": preferences
+            }
+        }
+
+        logger.info(f"Sending UI Update: {trip_data}")
+
+        payload_json = json.dumps(trip_data)
+        await self.room.local_participant.publish_data(
+            payload=payload_json,
+            topic="trip_events",
+            reliable=True
+        )
+
+        return "User UI updated with current details."
 
 
 server = AgentServer()
@@ -50,11 +93,14 @@ server = AgentServer()
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
+    await ctx.connect()
+
+    logger.info(f"Agent connected to room: {ctx.room.name}")
+
     session = AgentSession(
         stt=google.STT(
             model="telephony",
             languages="hi-IN",
-            # location="asia-south1",
         ),
         llm=google.LLM(
             model="gemini-2.5-flash",
@@ -63,29 +109,26 @@ async def my_agent(ctx: agents.JobContext):
             project="cabswale-ai",
         ),
         tts=google.TTS(
-            # gender="female",
             voice_name="hi-IN-Chirp3-HD-Aoede",
-            # voice_name="hi-IN-Neural2-A",
             language="hi-IN",
-            # model_name="gemini-2.5-flash-preview-tts",
         ),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
     )
 
+    agent_instance = Assistant(room=ctx.room)
+
     await session.start(
         room=ctx.room,
-        agent=Assistant(),
+        agent=agent_instance,
         room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: noise_cancellation.BVCTelephony(
-                ) if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP else noise_cancellation.BVC(),
-            ),
+            audio_input=room_io.AudioInputOptions(),
         ),
     )
 
     await session.generate_reply(
-        instructions="Greet the user and offer your assistance.",
+        instructions="""Greet the user in Hinglish, introduce yourself as
+        Raahi, and ask how you can help with their travel plans today.""",
     )
 
 
