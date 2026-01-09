@@ -30,8 +30,11 @@ services:
 
   # --- 3. Redis ---
   redis:
-    image: redis:8-alpine
+    image: redis/redis-stack:latest
     restart: unless-stopped
+    ports:
+      - "6379:6379"
+      - "8001:8001"
 
   # --- 4. AI Agent ---
   agent:
@@ -56,6 +59,9 @@ services:
     environment:
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
 
 volumes:
   caddy_data:

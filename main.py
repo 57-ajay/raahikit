@@ -10,11 +10,7 @@ from livekit.agents import (
 )
 from livekit.plugins import google, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-
-try:
-    from raahikit.prompt import PROMPT
-except ImportError:
-    from prompt import PROMPT
+from prompt import PROMPT
 
 load_dotenv(".env")
 
@@ -24,6 +20,16 @@ logger = logging.getLogger("raahi-agent")
 class Assistant(Agent):
     def __init__(self, room: rtc.Room) -> None:
         self.room = room
+        self.trip_info = {
+            "origin": None,
+            "destination": None,
+            "start_date": None,
+            "return_date": None,
+            "preferences": {
+                "vehicle_type": None
+            }
+        }
+
         formatted_prompt = PROMPT.format(
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M")
         )
@@ -51,9 +57,18 @@ class Assistant(Agent):
             destination: Drop-off location.
             start_date: ISO 8601 string for the trip start.
             trip_type: 'one_way' or 'round_trip'.
-            preferences: Dictionary containing vehicle_type and driver_language.
+            preferences: Dictionary containing vehicle_type.
             return_date: ISO 8601 string for return trip.
         """
+
+        if origin:
+            self.trip_info["origin"] = origin
+        if destination:
+            self.trip_info["destination"] = destination
+        if start_date:
+            self.trip_info["start_date"] = start_date
+        if preferences:
+            self.trip_info["preferences"] = preferences
 
         final_return_date = return_date
         if trip_type == "one_way" and start_date and not final_return_date:
@@ -64,25 +79,21 @@ class Assistant(Agent):
             except ValueError:
                 pass
 
+        if final_return_date:
+            self.trip_info["return_date"] = final_return_date
+
         trip_data = {
             "event": "trip_update",
-            "details": {
-                "origin": origin,
-                "destination": destination,
-                "start_date": start_date,
-                "return_date": final_return_date,
-                "trip_type": trip_type,
-                "preferences": preferences
-            }
+            "details": self.trip_info
         }
 
         logger.info(f"Sending UI Update: {trip_data}")
 
-        payload_json = json.dumps(trip_data)
+        payload_json = json.dumps(trip_data).encode("utf-8")
         await self.room.local_participant.publish_data(
             payload=payload_json,
             topic="trip_events",
-            reliable=True
+            reliable=True,
         )
 
         return "User UI updated with current details."

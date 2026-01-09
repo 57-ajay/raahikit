@@ -9,4 +9,5 @@ dependencies = [
     "livekit-plugins-noise-cancellation~=0.2",
     "livekit-plugins-silero>=1.3.10",
     "python-dotenv>=1.2.1",
+    "redisvl>=0.13.2",
 ]

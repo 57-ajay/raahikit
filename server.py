@@ -7,10 +7,9 @@ from starlette.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import cast
+from datetime import timedelta
 
 load_dotenv(".env.local")
-
-app = FastAPI()
 
 app = FastAPI(
     middleware=[
@@ -24,9 +23,11 @@ app = FastAPI(
     ]
 )
 
+
 class TokenRequest(BaseModel):
     room_name: str
     participant_name: str
+
 
 @app.post("/getToken")
 async def get_token(req: TokenRequest):
@@ -40,7 +41,7 @@ async def get_token(req: TokenRequest):
             can_publish=True,
             can_subscribe=True
         )
-    ).with_identity(req.participant_name).with_name(req.participant_name)
+    ).with_identity(req.participant_name).with_name(req.participant_name).with_ttl(timedelta(minutes=60))
 
     return {"token": token.to_jwt()}
 
