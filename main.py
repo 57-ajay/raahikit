@@ -1,41 +1,31 @@
 import logging
-import json
 from typing import Optional
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
-from livekit.agents import (
-    AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
-)
+from livekit.agents import AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
 from livekit.plugins import google, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
 from prompt import PROMPT
+from events import UIEventManager
+from schemas import TripDetails
 
 load_dotenv(".env")
-
 logger = logging.getLogger("raahi-agent")
 
 
 class Assistant(Agent):
     def __init__(self, room: rtc.Room) -> None:
         self.room = room
-        self.trip_info = {
-            "origin": None,
-            "destination": None,
-            "start_date": None,
-            "return_date": None,
-            "preferences": {
-                "vehicle_type": None
-            }
-        }
+        self.trip_info = TripDetails()
+        self.ui = UIEventManager(room)
 
         formatted_prompt = PROMPT.format(
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M")
         )
-        super().__init__(
-            instructions=formatted_prompt,
-        )
+        super().__init__(instructions=formatted_prompt)
 
     @function_tool
     async def update_trip(
@@ -49,54 +39,32 @@ class Assistant(Agent):
         return_date: Optional[str] = None,
     ):
         """
-        Updates the trip details on the user's screen in real-time.
-        Call this tool whenever the user provides new information.
-
-        Args:
-            origin: Pickup location.
-            destination: Drop-off location.
-            start_date: ISO 8601 string for the trip start.
-            trip_type: 'one_way' or 'round_trip'.
-            preferences: Dictionary containing vehicle_type.
-            return_date: ISO 8601 string for return trip.
+        Updates the trip details on the user's screen.
+        Call this immediately when the user provides any piece of booking info.
         """
-
         if origin:
-            self.trip_info["origin"] = origin
+            self.trip_info.origin = origin
         if destination:
-            self.trip_info["destination"] = destination
+            self.trip_info.destination = destination
         if start_date:
-            self.trip_info["start_date"] = start_date
+            self.trip_info.start_date = start_date
+        if trip_type:
+            self.trip_info.trip_type = trip_type
         if preferences:
-            self.trip_info["preferences"] = preferences
+            self.trip_info.preferences.update(preferences)
 
-        final_return_date = return_date
-        if trip_type == "one_way" and start_date and not final_return_date:
+        if trip_type == "one_way" and start_date and not return_date:
             try:
                 start_dt = datetime.fromisoformat(start_date)
-                return_dt = start_dt + timedelta(hours=12)
-                final_return_date = return_dt.isoformat()
+                self.trip_info.return_date = (
+                    start_dt + timedelta(hours=12)).isoformat()
             except ValueError:
                 pass
+        elif return_date:
+            self.trip_info.return_date = return_date
 
-        if final_return_date:
-            self.trip_info["return_date"] = final_return_date
-
-        trip_data = {
-            "event": "trip_update",
-            "details": self.trip_info
-        }
-
-        logger.info(f"Sending UI Update: {trip_data}")
-
-        payload_json = json.dumps(trip_data).encode("utf-8")
-        await self.room.local_participant.publish_data(
-            payload=payload_json,
-            topic="trip_events",
-            reliable=True,
-        )
-
-        return "User UI updated with current details."
+        await self.ui.send_trip_update(self.trip_info)
+        return "User UI updated with trip details."
 
 
 server = AgentServer()

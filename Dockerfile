@@ -23,7 +23,7 @@ RUN uv pip install --system \
     redisvl \
     'fastapi[all]'
 
-COPY main.py server.py prompt.py ./
+COPY main.py server.py prompt.py schemas.py events.py ./
 
 RUN python main.py download-files
 
