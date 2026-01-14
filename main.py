@@ -1,4 +1,5 @@
 import logging
+import json
 from typing import Optional
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -10,7 +11,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from prompt import PROMPT
 from events import UIEventManager
-from schemas import TripDetails
+from schemas import TripDetails, IncomingUserSelection
 
 load_dotenv(".env")
 logger = logging.getLogger("raahi-agent")
@@ -26,6 +27,15 @@ class Assistant(Agent):
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M")
         )
         super().__init__(instructions=formatted_prompt)
+
+    async def handle_ui_selection(self, selection: IncomingUserSelection):
+        """Processes selection events from the frontend UI."""
+        if selection.type == "vehicle_type":
+            self.trip_info.preferences["vehicle_type"] = selection.value
+            logger.info(f"""Updated vehicle preference from UI: {
+                        selection.value}""")
+
+            await self.ui.send_trip_update(self.trip_info)
 
     @function_tool
     async def update_trip(
@@ -96,6 +106,31 @@ async def my_agent(ctx: agents.JobContext):
     )
 
     agent_instance = Assistant(room=ctx.room)
+
+    @ctx.room.on("data_received")
+    def on_data_received(data: rtc.DataPacket):
+        if data.participant is None:
+            return
+
+        try:
+            payload = json.loads(data.data.decode("utf-8"))
+            if payload.get("event") == "user_selection":
+                selection = IncomingUserSelection(**payload)
+
+                import asyncio
+                asyncio.create_task(process_selection(selection))
+
+        except Exception as e:
+            logger.error(f"Failed to process data message: {e}")
+
+    async def process_selection(selection: IncomingUserSelection):
+        await agent_instance.handle_ui_selection(selection)
+
+        await session.generate_reply(
+            instructions=f"""User has selected {selection.value}
+                as their vehicle type via the UI.
+                Acknowledge this and reply accordingly."""
+        )
 
     await session.start(
         room=ctx.room,

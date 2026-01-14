@@ -22,3 +22,13 @@ class UIEventPayload(BaseModel):
     event: UIEventType
     details: Dict[str, Any]
     timestamp: str
+
+
+class UserSelectionType(str, Enum):
+    VEHICLE_TYPE = "vehicle_type"
+
+
+class IncomingUserSelection(BaseModel):
+    event: str
+    type: UserSelectionType
+    value: str
