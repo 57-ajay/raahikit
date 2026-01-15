@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import cast
 from datetime import timedelta
+import json
 
 load_dotenv(".env.local")
 
@@ -27,10 +28,20 @@ app = FastAPI(
 class TokenRequest(BaseModel):
     room_name: str
     participant_name: str
+    phone_number: str
+    user_name: str
 
 
 @app.post("/getToken")
 async def get_token(req: TokenRequest):
+
+    user = {
+        "name": req.user_name if req.user_name else "Cabswale Traveller",
+        "phone_number": req.phone_number if req.phone_number else "UNKNOWN",
+        "participant_name": req.participant_name if req.participant_name else "UNKNOWN"
+    }
+
+    user_str = json.dumps(user)
     token = api.AccessToken(
         os.getenv("LIVEKIT_API_KEY"),
         os.getenv("LIVEKIT_API_SECRET")
@@ -41,7 +52,7 @@ async def get_token(req: TokenRequest):
             can_publish=True,
             can_subscribe=True
         )
-    ).with_identity(req.participant_name).with_name(req.participant_name).with_ttl(timedelta(minutes=60))
+    ).with_identity(req.participant_name).with_name(user_str).with_ttl(timedelta(minutes=60))
 
     return {"token": token.to_jwt()}
 

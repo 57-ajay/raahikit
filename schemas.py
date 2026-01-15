@@ -7,12 +7,22 @@ class UIEventType(str, Enum):
     TRIP_UPDATE = "trip_update"
 
 
+class UserProfile(BaseModel):
+    """
+    Modular user profile. Add fields here to extend user context.
+    Client should send this as JSON in participant metadata.
+    """
+    name: str = "Cabswale Traveller"
+    phone_number: str = "Unknown"
+    extra_data: Dict[str, Any] = Field(default_factory=dict)
+
+
 class TripDetails(BaseModel):
-    origin: Optional[str] = None
+    pickup: Optional[str] = None
     destination: Optional[str] = None
-    start_date: Optional[str] = None
-    return_date: Optional[str] = None
-    trip_type: Optional[str] = None
+    startDate: Optional[str] = None
+    endDate: Optional[str] = None
+    tripType: Optional[str] = None
     show_vehicle_choices: bool = False
 
     preferences: Dict[str, Any] = Field(

@@ -12,21 +12,27 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from prompt import PROMPT
 from events import UIEventManager
-from schemas import TripDetails, IncomingUserSelection
+from schemas import TripDetails, IncomingUserSelection, UserProfile
 
 load_dotenv(".env")
 logger = logging.getLogger("raahi-agent")
 
 
 class Assistant(Agent):
-    def __init__(self, room: rtc.Room) -> None:
+    def __init__(self, room: rtc.Room, user_profile: UserProfile) -> None:
         self.room = room
         self.trip_info = TripDetails()
         self.ui = UIEventManager(room)
+        self.user_profile = user_profile
 
         formatted_prompt = PROMPT.format(
-            current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M")
+            current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M"),
+            user_name=self.user_profile.name,
+            user_phone=self.user_profile.phone_number,
+            user_context_json=json.dumps(
+                self.user_profile.extra_data, indent=2)
         )
+
         super().__init__(instructions=formatted_prompt)
 
     async def handle_ui_selection(self, selection: IncomingUserSelection):
@@ -43,12 +49,12 @@ class Assistant(Agent):
     async def update_trip(
         self,
         ctx: RunContext,
-        origin: Optional[str] = None,
+        pickup: Optional[str] = None,
         destination: Optional[str] = None,
-        start_date: Optional[str] = None,
-        trip_type: Optional[str] = None,
+        startDate: Optional[str] = None,
+        tripType: Optional[str] = None,
         preferences: Optional[dict] = None,
-        return_date: Optional[str] = None,
+        endDate: Optional[str] = None,
         show_vehicle_choices: Optional[bool] = False,
     ):
         """
@@ -61,29 +67,30 @@ class Assistant(Agent):
                           'availableForDrivingInEventWedding', etc.]
             show_vehicle_choices: Set to True ONLY when asking for 'vehicle_type'.
         """
-        if origin:
-            self.trip_info.origin = origin
+        if pickup:
+            self.trip_info.pickup = pickup
         if destination:
             self.trip_info.destination = destination
-        if start_date:
-            self.trip_info.start_date = start_date
-        if trip_type:
-            self.trip_info.trip_type = trip_type
+        if startDate:
+            self.trip_info.startDate = startDate
+        if tripType:
+            self.trip_info.tripType = tripType
         if preferences:
             self.trip_info.preferences.update(preferences)
-
+        if isinstance(preferences, dict) and preferences.get("vehicle_type") is not None:
+            preferences["vehicleTypesList"] = [preferences["vehicle_type"]]
         if show_vehicle_choices is not None:
             self.trip_info.show_vehicle_choices = show_vehicle_choices
 
-        if trip_type == "one_way" and start_date and not return_date:
+        if tripType == "one-way" and startDate and not endDate:
             try:
-                start_dt = datetime.fromisoformat(start_date)
-                self.trip_info.return_date = (
+                start_dt = datetime.fromisoformat(startDate)
+                self.trip_info.endDate = (
                     start_dt + timedelta(hours=12)).isoformat()
             except ValueError:
                 pass
-        elif return_date:
-            self.trip_info.return_date = return_date
+        elif endDate:
+            self.trip_info.endDate = endDate
 
         await self.ui.send_trip_update(self.trip_info)
         return "User UI updated with trip details."
@@ -97,6 +104,22 @@ async def my_agent(ctx: agents.JobContext):
     await ctx.connect()
 
     logger.info(f"Agent connected to room: {ctx.room.name}")
+
+    user = ctx.room.metadata
+    logger.info(f"metadata: {user}")
+    participant = next(iter(ctx.room.remote_participants.values()), None)
+    user_profile = UserProfile()
+
+    if participant and participant.name:
+        try:
+            logger.info(f"Parsing user metadata: {participant.metadata}")
+            meta_data = json.loads(participant.name)
+            user_profile = UserProfile(**meta_data)
+        except Exception as e:
+            logger.warning(
+                f"Failed to parse user metadata, using defaults. Error: {e}")
+
+    logger.info(f"Session started for user: {user_profile.name}")
 
     session = AgentSession(
         stt=google.STT(
@@ -117,7 +140,7 @@ async def my_agent(ctx: agents.JobContext):
         turn_detection=MultilingualModel(),
     )
 
-    agent_instance = Assistant(room=ctx.room)
+    agent_instance = Assistant(room=ctx.room, user_profile=user_profile)
 
     @ctx.room.on("data_received")
     def on_data_received(data: rtc.DataPacket):
@@ -152,9 +175,15 @@ async def my_agent(ctx: agents.JobContext):
     )
 
     await session.generate_reply(
-        instructions="""Greet the user in Hinglish, introduce yourself as
-        Raahi, and ask how you can help with their travel plans today.""",
+        instructions=f"""Greet the user in Hinglish.
+        If the user's name is known ({user_profile.name} is not 'Cabswale Traveller'), use it warmly.
+        Introduce yourself as Raahi, and ask how you can help with their travel plans today.""",
     )
+
+    # await session.generate_reply(
+    #     instructions="""Greet the user in Hinglish, introduce yourself as
+    #     Raahi, and ask how you can help with their travel plans today.""",
+    # )
 
 
 if __name__ == "__main__":
