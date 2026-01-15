@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
-from livekit.agents import AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
+from livekit.agents import (
+    AgentServer, AgentSession, Agent, room_io, function_tool, RunContext)
 from livekit.plugins import google, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -32,6 +33,7 @@ class Assistant(Agent):
         """Processes selection events from the frontend UI."""
         if selection.type == "vehicle_type":
             self.trip_info.preferences["vehicle_type"] = selection.value
+            self.trip_info.show_vehicle_choices = False
             logger.info(f"""Updated vehicle preference from UI: {
                         selection.value}""")
 
@@ -47,10 +49,17 @@ class Assistant(Agent):
         trip_type: Optional[str] = None,
         preferences: Optional[dict] = None,
         return_date: Optional[str] = None,
+        show_vehicle_choices: Optional[bool] = False,
     ):
         """
-        Updates the trip details on the user's screen.
-        Call this immediately when the user provides any piece of booking info.
+        Updates the trip details.
+
+        Args:
+            preferences: Dict containing 'vehicle_type' and optional silent preferences:
+                         ['gender', 'languages', 'isPetAllowed', 'fuelType', 'married',
+                          'withCarrier', 'age', 'connections', 'dlDateOfIssue',
+                          'availableForDrivingInEventWedding', etc.]
+            show_vehicle_choices: Set to True ONLY when asking for 'vehicle_type'.
         """
         if origin:
             self.trip_info.origin = origin
@@ -62,6 +71,9 @@ class Assistant(Agent):
             self.trip_info.trip_type = trip_type
         if preferences:
             self.trip_info.preferences.update(preferences)
+
+        if show_vehicle_choices is not None:
+            self.trip_info.show_vehicle_choices = show_vehicle_choices
 
         if trip_type == "one_way" and start_date and not return_date:
             try:
@@ -127,9 +139,8 @@ async def my_agent(ctx: agents.JobContext):
         await agent_instance.handle_ui_selection(selection)
 
         await session.generate_reply(
-            instructions=f"""User has selected {selection.value}
-                as their vehicle type via the UI.
-                Acknowledge this and reply accordingly."""
+            instructions=f"""User has selected {selection.value} via UI.
+            Confirm this briefly and proceed to completion if all fields are done."""
         )
 
     await session.start(

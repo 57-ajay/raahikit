@@ -29,21 +29,12 @@ class UIEventManager:
         )
 
     async def send_trip_update(self, trip_info: TripDetails):
-        """Helper for standard trip updates."""
-        if (
-            trip_info.origin
-            and trip_info.destination
-            and trip_info.start_date
-            and trip_info.return_date
-            and trip_info.trip_type
-            and not trip_info.preferences["vehicle_type"]
-        ):
-            await self.emit(
-                UIEventType.ASK_VEHICLE_TYPE,
-                trip_info.model_dump(),
-            )
-        else:
-            await self.emit(
-                UIEventType.TRIP_UPDATE,
-                trip_info.model_dump(),
-            )
+        """
+        Standard trip update.
+        The client should check 'show_vehicle_choices' in the payload
+        to decide whether to display the vehicle selection UI.
+        """
+        await self.emit(
+            UIEventType.TRIP_UPDATE,
+            trip_info.model_dump(),
+        )
