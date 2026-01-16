@@ -23,7 +23,7 @@ class TripDetails(BaseModel):
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     tripType: Optional[str] = None
-    show_vehicle_choices: bool = False
+    createTrip: bool = False
 
     preferences: Dict[str, Any] = Field(
         default_factory=lambda: {

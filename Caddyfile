@@ -1,0 +1,5 @@
+{$DOMAIN_NAME} {
+    reverse_proxy /getToken* token-server:3000
+
+    reverse_proxy * livekit:7880
+}

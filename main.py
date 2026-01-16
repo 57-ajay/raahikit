@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import json
 from typing import Optional
 from datetime import datetime, timedelta
@@ -55,7 +56,7 @@ class Assistant(Agent):
         tripType: Optional[str] = None,
         preferences: Optional[dict] = None,
         endDate: Optional[str] = None,
-        show_vehicle_choices: Optional[bool] = False,
+        createTrip: Optional[bool] = False,
     ):
         """
         Updates the trip details.
@@ -65,7 +66,7 @@ class Assistant(Agent):
                          ['gender', 'languages', 'isPetAllowed', 'fuelType', 'married',
                           'withCarrier', 'age', 'connections', 'dlDateOfIssue',
                           'availableForDrivingInEventWedding', etc.]
-            show_vehicle_choices: Set to True ONLY when asking for 'vehicle_type'.
+            createTrip: Set to True ONLY when we have full trip information.
         """
         if pickup:
             self.trip_info.pickup = pickup
@@ -79,8 +80,8 @@ class Assistant(Agent):
             self.trip_info.preferences.update(preferences)
         if isinstance(preferences, dict) and preferences.get("vehicle_type") is not None:
             preferences["vehicleTypesList"] = [preferences["vehicle_type"]]
-        if show_vehicle_choices is not None:
-            self.trip_info.show_vehicle_choices = show_vehicle_choices
+        if createTrip is not None:
+            self.trip_info.createTrip = createTrip
 
         if tripType == "one-way" and startDate and not endDate:
             try:
@@ -129,7 +130,7 @@ async def my_agent(ctx: agents.JobContext):
         llm=google.LLM(
             model="gemini-2.5-flash",
             vertexai=True,
-            location="us-central1",
+            location="asia-south1",
             project="cabswale-ai",
         ),
         tts=google.TTS(
@@ -152,7 +153,6 @@ async def my_agent(ctx: agents.JobContext):
             if payload.get("event") == "user_selection":
                 selection = IncomingUserSelection(**payload)
 
-                import asyncio
                 asyncio.create_task(process_selection(selection))
 
         except Exception as e:
@@ -175,15 +175,11 @@ async def my_agent(ctx: agents.JobContext):
     )
 
     await session.generate_reply(
-        instructions=f"""Greet the user in Hinglish.
-        If the user's name is known ({user_profile.name} is not 'Cabswale Traveller'), use it warmly.
-        Introduce yourself as Raahi, and ask how you can help with their travel plans today.""",
+        instructions="""Greet the user warmly like ->
+        'namaste mai Raahi Mai aap ki trip create karne me kaise madad kar sakti hu?'.
+        Then, strictly ask: 'Aap Apna pickup aur Drop city bataiye.'
+        """,
     )
-
-    # await session.generate_reply(
-    #     instructions="""Greet the user in Hinglish, introduce yourself as
-    #     Raahi, and ask how you can help with their travel plans today.""",
-    # )
 
 
 if __name__ == "__main__":

@@ -3,11 +3,12 @@ services:
   caddy:
     image: caddy:latest
     restart: unless-stopped
-    command: caddy reverse-proxy --from ${DOMAIN_NAME} --to livekit:7880
+    # command: caddy reverse-proxy --from ${DOMAIN_NAME} --to livekit:7880
     ports:
       - "80:80"
       - "443:443"
     volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
       - caddy_config:/config
     environment:
@@ -54,8 +55,8 @@ services:
     build: .
     restart: always
     command: uv run uvicorn server:app --host 0.0.0.0 --port 3000
-    ports:
-      - "3000:3000"
+    # ports:
+    #   - "3000:3000"
     environment:
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
