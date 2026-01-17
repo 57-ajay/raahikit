@@ -4,10 +4,11 @@ import json
 from typing import Optional
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-
+from google.cloud import texttospeech
 from livekit import agents, rtc
+from livekit.agents.tts import StreamAdapter
 from livekit.agents import (
-    AgentServer, AgentSession, Agent, room_io, function_tool, RunContext)
+    AgentServer, AgentSession, Agent, room_io, function_tool, RunContext, tokenize)
 from livekit.plugins import google, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
@@ -133,9 +134,14 @@ async def my_agent(ctx: agents.JobContext):
             location="asia-south1",
             project="cabswale-ai",
         ),
-        tts=google.TTS(
-            voice_name="hi-IN-Chirp3-HD-Aoede",
-            language="hi-IN",
+
+        tts=StreamAdapter(
+            tts=google.TTS(
+                voice_name="hi-IN-Chirp3-HD-Aoede",
+                language="hi-IN",
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            ),
+            sentence_tokenizer=tokenize.basic.SentenceTokenizer(),
         ),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
