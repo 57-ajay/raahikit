@@ -52,7 +52,7 @@ async def get_token(req: TokenRequest):
             can_publish=True,
             can_subscribe=True
         )
-    ).with_identity(req.participant_name).with_name(user_str).with_ttl(timedelta(minutes=10))
+    ).with_identity(req.participant_name).with_name(user_str).with_ttl(timedelta(minutes=100))
 
     return {"token": token.to_jwt()}
 
