@@ -223,23 +223,6 @@ async def my_agent(ctx: agents.JobContext):
     async def on_timeout(reason: str):
         """Handle session timeout."""
         logger.warning(f"Session timeout: {reason}")
-
-        messages = {
-            "silence_timeout": "Aapki taraf se koi response nahi aa raha. Session end ho raha hai.",
-            "noise_flood_timeout": "Background noise bahut zyada hai aur aapki awaaz samajh nahi aa rahi. Please thodi der baad dobara try karein.",
-        }
-
-        goodbye = messages.get(reason, "Session end ho raha hai.")
-
-        try:
-            if session and not session_ended.is_set():
-                await session.generate_reply(
-                    instructions=f"Say exactly: '{goodbye} Dhanyavaad!'"
-                )
-                await asyncio.sleep(3)
-        except Exception as e:
-            logger.error(f"Failed to send goodbye: {e}")
-
         session_ended.set()
 
     # ========================================================================
