@@ -20,7 +20,6 @@ import time
 
 logger = logging.getLogger("noise-cancellation")
 
-# Check available libraries
 NOISEREDUCE_AVAILABLE = False
 
 try:
@@ -35,20 +34,17 @@ except ImportError:
 class NoiseCancellationConfig:
     """Configuration for noise cancellation and session management."""
 
-    # Noise cancellation
     enabled: bool = True
 
     # Noise reduction strength (0.0-1.0, higher = more aggressive)
     noise_reduction_strength: float = 0.7
 
-    # Session timeout settings
     silence_timeout_seconds: float = 15.0
     noise_flood_timeout_seconds: float = 15.0
 
     # VAD settings (energy-based)
     speech_energy_threshold: float = 0.01  # RMS energy threshold
 
-    # Don't timeout while agent is speaking
     agent_speaking_grace_seconds: float = 5.0
 
 
@@ -97,7 +93,7 @@ class NoiseReduceProcessor:
         self.strength = strength
         self._noise_profile: Optional[np.ndarray] = None
         self._frame_buffer: list = []
-        self._buffer_size = 5  # Accumulate frames for better noise estimation
+        self._buffer_size = 5
 
     def process_frame(self, audio_data: np.ndarray, sample_rate: int = 16000) -> tuple[np.ndarray, float]:
         """
@@ -111,21 +107,16 @@ class NoiseReduceProcessor:
             return audio_data, energy
 
         try:
-            # Convert to float
             if audio_data.dtype == np.int16:
                 audio_float = audio_data.astype(np.float32) / 32768.0
             else:
                 audio_float = audio_data.astype(np.float32)
 
-            # Calculate energy for VAD
             energy = np.sqrt(np.mean(audio_float ** 2))
 
-            # Skip processing for very quiet frames (saves CPU)
             if energy < 0.001:
                 return audio_data, energy
 
-            # Apply noise reduction using non-stationary mode
-            # This adapts to changing noise conditions
             reduced = nr.reduce_noise(
                 y=audio_float,
                 sr=sample_rate,
@@ -136,7 +127,6 @@ class NoiseReduceProcessor:
                 time_mask_smooth_ms=50,
             )
 
-            # Convert back to int16
             output = (reduced * 32768.0).clip(-32768, 32767).astype(np.int16)
             return output, energy
 
@@ -161,7 +151,6 @@ class NoiseCancellationManager:
         self.on_timeout = on_timeout
         self.metrics = AudioMetrics()
 
-        # Initialize processor
         if NOISEREDUCE_AVAILABLE and self.config.enabled:
             self._processor = NoiseReduceProcessor(
                 self.config.noise_reduction_strength)
@@ -171,7 +160,6 @@ class NoiseCancellationManager:
             self._processor = None
             logger.warning("No noise cancellation processor available")
 
-        # Monitoring
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
         self._sample_rate = 16000  # Will be updated from first frame
@@ -192,7 +180,6 @@ class NoiseCancellationManager:
             except asyncio.CancelledError:
                 pass
 
-        # Log session stats
         if self.metrics.frames_processed > 0:
             speech_ratio = self.metrics.speech_frames / self.metrics.frames_processed
             logger.info(f"Session stats: {self.metrics.frames_processed} frames, "
@@ -237,18 +224,15 @@ class NoiseCancellationManager:
 
                 now = time.time()
 
-                # Calculate durations
                 silence_duration = now - self.metrics.last_speech_time
                 stt_silence_duration = now - self.metrics.last_valid_stt_time
                 agent_silence = now - self.metrics.last_agent_speech_time
 
-                # Don't timeout if agent recently spoke (give user time to respond)
                 if agent_silence < self.config.agent_speaking_grace_seconds:
                     logger.debug(f"""Agent spoke {
                                  agent_silence:.1f}s ago, skipping timeout check""")
                     continue
 
-                # Check for pure silence timeout
                 if silence_duration >= self.config.silence_timeout_seconds:
                     logger.warning(f"""Silence timeout: no audio energy for {
                                    silence_duration:.1f}s""")
@@ -256,7 +240,6 @@ class NoiseCancellationManager:
                         await self.on_timeout("silence_timeout")
                     break
 
-                # Check for noise flood (audio energy but no STT results)
                 avg_energy = self.metrics.get_average_energy()
                 if (avg_energy > self.config.speech_energy_threshold and
                         stt_silence_duration >= self.config.noise_flood_timeout_seconds):

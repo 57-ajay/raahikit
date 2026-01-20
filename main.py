@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import json
+import time
 import numpy as np
 from typing import Optional, AsyncIterable
 from datetime import datetime, timedelta
@@ -27,15 +28,11 @@ from noise_cancellation import (
 load_dotenv(".env")
 logger = logging.getLogger("raahi-agent")
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-# Session timeouts
-USER_AWAY_TIMEOUT = 15.0              # Built-in LiveKit timeout (backup)
-SILENCE_TIMEOUT = 20.0                # No audio energy at all
-NOISE_FLOOD_TIMEOUT = 20.0            # Audio but no valid STT
+USER_AWAY_TIMEOUT = 30.0              # Built-in LiveKit timeout (backup)
+SILENCE_TIMEOUT = 30.0                # No audio energy at all
+NOISE_FLOOD_TIMEOUT = 30.0            # Audio but no valid STT
+MAX_UTTERANCE_DURATION = 15.0
 
-# Noise cancellation
 ENABLE_NOISE_CANCELLATION = True
 NOISE_REDUCTION_STRENGTH = 0.7        # 0.0-1.0, higher = more aggressive
 
@@ -44,7 +41,6 @@ SPEECH_ENERGY_THRESHOLD = 0.01
 
 # VAD tuning (higher = less sensitive to noise)
 VAD_ACTIVATION_THRESHOLD = 0.5        # 0.4-0.7
-# ============================================================================
 
 
 class Assistant(Agent):
@@ -88,7 +84,6 @@ class Assistant(Agent):
         This is an async generator that yields SpeechEvents.
         """
         if self.nc_manager and ENABLE_NOISE_CANCELLATION:
-            # Process audio through noise cancellation, then iterate over STT events
             async for event in Agent.default.stt_node(
                 self,
                 self._process_audio_with_nc(audio),
@@ -96,7 +91,6 @@ class Assistant(Agent):
             ):
                 yield event
         else:
-            # No noise cancellation, pass through to default STT
             async for event in Agent.default.stt_node(self, audio, model_settings):
                 yield event
 
@@ -109,19 +103,14 @@ class Assistant(Agent):
         """
         async for frame in audio_stream:
             try:
-                # Get raw audio data as numpy array
-                # frame.data is a memoryview of int16, convert to bytes first
                 frame_bytes = bytes(frame.data.cast('b'))
                 audio_data = np.frombuffer(frame_bytes, dtype=np.int16).copy()
 
-                # Process through noise cancellation (pass sample rate)
                 processed_data, energy = self.nc_manager.process_audio_frame(
                     audio_data,
                     sample_rate=frame.sample_rate
                 )
 
-                # Create new frame with processed audio
-                # Preserve all original frame properties
                 processed_frame = rtc.AudioFrame(
                     data=processed_data.tobytes(),
                     sample_rate=frame.sample_rate,
@@ -195,13 +184,11 @@ async def my_agent(ctx: agents.JobContext):
     await ctx.connect()
     logger.info(f"Agent connected to room: {ctx.room.name}")
 
-    # Log noise cancellation status
     if NOISEREDUCE_AVAILABLE and ENABLE_NOISE_CANCELLATION:
-        logger.info("✓ Noise cancellation ENABLED (noisereduce)")
+        logger.info("Noise cancellation ENABLED (noisereduce)")
     else:
-        logger.warning("✗ Noise cancellation DISABLED")
+        logger.warning("Noise cancellation DISABLED")
 
-    # Parse user profile
     participant = next(iter(ctx.room.remote_participants.values()), None)
     user_profile = UserProfile()
 
@@ -214,20 +201,45 @@ async def my_agent(ctx: agents.JobContext):
 
     logger.info(f"Session started for user: {user_profile.name}")
 
-    # ========================================================================
-    # SESSION STATE
-    # ========================================================================
     session_ended = asyncio.Event()
     session: Optional[AgentSession] = None
 
+    user_speech_start_time: Optional[float] = None
+    long_utterance_task: Optional[asyncio.Task] = None
+    accumulated_transcript: str = ""
+
     async def on_timeout(reason: str):
-        """Handle session timeout."""
+        """Handle session timeout - silently end without any message."""
         logger.warning(f"Session timeout: {reason}")
         session_ended.set()
 
-    # ========================================================================
-    # NOISE CANCELLATION SETUP
-    # ========================================================================
+    async def handle_long_utterance():
+        """Called when user speaks for too long - interrupt and respond."""
+        nonlocal accumulated_transcript
+
+        await asyncio.sleep(MAX_UTTERANCE_DURATION)
+
+        if session and not session_ended.is_set():
+            logger.info(f"""Long utterance detected ({
+                        MAX_UTTERANCE_DURATION}s), interrupting...""")
+
+            transcript_so_far = accumulated_transcript.strip()
+
+            if transcript_so_far:
+                await session.generate_reply(
+                    instructions=f"""The user has been speaking for a long time. Their message so far: "{transcript_so_far}"
+
+                    RULES:
+                    1. If this contains ANY trip-related info (pickup, destination, date, trip type), extract it, call update_trip, and continue the booking flow naturally.
+                    2. If this is completely unrelated to cab booking (chatting, asking random questions, etc.), say: "Main sirf cab booking mein madad kar sakti hoon. Aap apna pickup aur drop city bataiye." and continue.
+                    3. Keep your response SHORT - one sentence max.
+                    4. Do NOT end the session."""
+                )
+            else:
+                await session.generate_reply(
+                    instructions="User was speaking but no clear words detected. Ask them to repeat: 'Sorry, aap dobara bataiye?'"
+                )
+
     nc_config = NoiseCancellationConfig(
         enabled=ENABLE_NOISE_CANCELLATION and NOISEREDUCE_AVAILABLE,
         noise_reduction_strength=NOISE_REDUCTION_STRENGTH,
@@ -242,9 +254,6 @@ async def my_agent(ctx: agents.JobContext):
         on_timeout=on_timeout,
     )
 
-    # ========================================================================
-    # CREATE SESSION
-    # ========================================================================
     session = AgentSession(
         stt=google.STT(
             model="telephony",
@@ -264,7 +273,6 @@ async def my_agent(ctx: agents.JobContext):
             ),
             sentence_tokenizer=tokenize.basic.SentenceTokenizer(),
         ),
-        # VAD tuned for noise rejection
         vad=silero.VAD.load(
             min_speech_duration=0.25,
             min_silence_duration=0.6,
@@ -274,28 +282,51 @@ async def my_agent(ctx: agents.JobContext):
             force_cpu=True,
         ),
         turn_detection=MultilingualModel(),
-        # Set high value - we handle timeout ourselves via NC manager
-        user_away_timeout=300.0,  # 5 minutes fallback
+        user_away_timeout=300.0,
     )
 
-    # Create agent with noise cancellation manager
     agent_instance = Assistant(
         room=ctx.room,
         user_profile=user_profile,
         nc_manager=nc_manager,
     )
 
-    # ========================================================================
-    # EVENT HANDLERS
-    # ========================================================================
-
     @session.on("user_input_transcribed")
     def on_transcription(ev):
-        """Track valid STT results for noise flood detection."""
+        """Track valid STT results for noise flood detection and long utterance handling."""
+        nonlocal accumulated_transcript
+
         transcript = getattr(ev, 'transcript', '') or ''
         if len(transcript.strip()) > 1:
             nc_manager.on_stt_result(transcript)
+            accumulated_transcript += " " + transcript
             logger.debug(f"Valid STT: {transcript[:50]}...")
+
+    @session.on("user_speech_started")
+    def on_user_speech_started(ev):
+        """Track when user starts speaking for long utterance detection."""
+        nonlocal user_speech_start_time, long_utterance_task, accumulated_transcript
+
+        user_speech_start_time = time.time()
+        accumulated_transcript = ""
+
+        if long_utterance_task and not long_utterance_task.done():
+            long_utterance_task.cancel()
+
+        long_utterance_task = asyncio.create_task(handle_long_utterance())
+        logger.debug("User started speaking, monitoring for long utterance")
+
+    @session.on("user_speech_committed")
+    def on_user_speech_committed(ev):
+        """User finished speaking normally - cancel long utterance monitor."""
+        nonlocal long_utterance_task, accumulated_transcript
+
+        if long_utterance_task and not long_utterance_task.done():
+            long_utterance_task.cancel()
+            logger.debug(
+                "User speech committed, cancelled long utterance monitor")
+
+        accumulated_transcript = ""
 
     @session.on("user_state_changed")
     def on_state_change(ev):
@@ -303,13 +334,16 @@ async def my_agent(ctx: agents.JobContext):
         state = getattr(ev, 'state', None)
         logger.debug(f"User state: {state}")
 
-        # Don't trigger timeout from LiveKit's user_away - we handle it ourselves
-        # This is just for logging
-
     @session.on("agent_speech_started")
     def on_agent_speech_started(ev):
         """Track when agent starts speaking."""
+        nonlocal long_utterance_task
+
         nc_manager.on_agent_speech()
+
+        if long_utterance_task and not long_utterance_task.done():
+            long_utterance_task.cancel()
+
         logger.debug("Agent started speaking")
 
     @session.on("agent_speech_stopped")
@@ -327,7 +361,6 @@ async def my_agent(ctx: agents.JobContext):
         try:
             payload = json.loads(data.data.decode("utf-8"))
             if payload.get("event") == "user_selection":
-                # User activity - update timeout tracker
                 nc_manager.metrics.on_stt_result()
 
                 selection = IncomingUserSelection(**payload)
@@ -342,11 +375,6 @@ async def my_agent(ctx: agents.JobContext):
                 selection.value}. Confirm briefly and continue."""
         )
 
-    # ========================================================================
-    # START SESSION
-    # ========================================================================
-
-    # Start noise cancellation manager (monitoring loop)
     await nc_manager.start()
 
     await session.start(
@@ -357,21 +385,19 @@ async def my_agent(ctx: agents.JobContext):
         ),
     )
 
-    # Initial greeting
     await session.generate_reply(
         instructions="""Greet warmly: 'Namaste, mai Raahi. Aap ki trip create karne me kaise madad kar sakti hu?'
         Then ask: 'Aap apna pickup aur drop city bataiye.'"""
     )
 
-    # ========================================================================
-    # WAIT FOR END
-    # ========================================================================
     try:
         await session_ended.wait()
     except asyncio.CancelledError:
         pass
     finally:
-        # Stop noise cancellation manager and log stats
+        if long_utterance_task and not long_utterance_task.done():
+            long_utterance_task.cancel()
+
         await nc_manager.stop()
         stats = nc_manager.get_stats()
         logger.info(f"Session stats: {stats}")
