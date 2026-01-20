@@ -209,8 +209,16 @@ async def my_agent(ctx: agents.JobContext):
     accumulated_transcript: str = ""
 
     async def on_timeout(reason: str):
+        data = {
+            "reason": reason,
+            "topic": "timeout",
+        }
         """Handle session timeout - silently end without any message."""
         logger.warning(f"Session timeout: {reason}")
+        await ctx.room.local_participant.publish_data(
+            str(data).encode(),
+            reliable=True,
+        )
         session_ended.set()
 
     async def handle_long_utterance():
@@ -386,7 +394,7 @@ async def my_agent(ctx: agents.JobContext):
     )
 
     await session.generate_reply(
-        instructions="""Greet warmly: 'Namaste, mai Raahi. Aap ki trip create karne me kaise madad kar sakti hu?'
+        instructions="""Greet warmly: 'Namaste, mai Raahi. main Aap ki trip create karne mai madad kar sakti hu'
         Then ask: 'Aap apna pickup aur drop city bataiye.'"""
     )
 
