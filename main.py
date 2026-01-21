@@ -31,7 +31,7 @@ logger = logging.getLogger("raahi-agent")
 USER_AWAY_TIMEOUT = 30.0              # Built-in LiveKit timeout (backup)
 SILENCE_TIMEOUT = 30.0                # No audio energy at all
 NOISE_FLOOD_TIMEOUT = 30.0            # Audio but no valid STT
-MAX_UTTERANCE_DURATION = 15.0
+MAX_UTTERANCE_DURATION = 15.0         # make it 30 secs too
 
 ENABLE_NOISE_CANCELLATION = True
 NOISE_REDUCTION_STRENGTH = 0.7        # 0.0-1.0, higher = more aggressive
