@@ -1,74 +1,97 @@
+"""
+Raahi Voice Agent - Clean Implementation
+
+Uses LiveKit's built-in features:
+- user_away_timeout for idle detection
+- user_state_changed event for handling user away/back
+- close_on_disconnect=False for session persistence
+- Built-in reconnection handling
+"""
+
 import logging
-import asyncio
 import json
-import time
-import numpy as np
-from typing import Optional, AsyncIterable
+import asyncio
+from typing import Optional
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from google.cloud import texttospeech
 from livekit import agents, rtc
-from livekit.agents.tts import StreamAdapter
 from livekit.agents import (
     AgentServer, AgentSession, Agent, room_io, function_tool, RunContext,
-    tokenize, stt
+    tokenize, UserStateChangedEvent
 )
-from livekit.agents.voice import ModelSettings
+from livekit.agents.tts import StreamAdapter
 from livekit.plugins import google, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from prompt import PROMPT
 from events import UIEventManager
-from schemas import (
-    TripDetails, IncomingUserSelection, UserProfile,
-    ClientEvent
-)
-from noise_cancellation import (
-    NoiseCancellationManager,
-    NoiseCancellationConfig,
-    NOISEREDUCE_AVAILABLE,
-)
+from schemas import TripDetails, IncomingUserSelection, UserProfile, ClientEvent
 from audio_responses import get_response, DEFAULT_EVENT_ID
 from audio_player import stream_wav_file
+
+
+# =============================================================================
+# SESSION STATE EVENTS (Agent <-> Client)
+# =============================================================================
+
+class SessionEvent:
+    """Events sent between agent and client."""
+    # Agent -> Client
+    PAUSED = "session_paused"
+    RESUMED = "session_resumed"
+
+    # Client -> Agent
+    RESUME_REQUEST = "session_resume"
+
 
 load_dotenv(".env")
 logger = logging.getLogger("raahi-agent")
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 
-USER_AWAY_TIMEOUT = 30.0
-SILENCE_TIMEOUT = 30.0
-NOISE_FLOOD_TIMEOUT = 30.0
-MAX_UTTERANCE_DURATION = 30.0
+class Config:
+    """Centralized configuration."""
+    USER_AWAY_TIMEOUT = 30.0
 
-ENABLE_NOISE_CANCELLATION = True
-NOISE_REDUCTION_STRENGTH = 0.7
+    CLOSE_ON_DISCONNECT = False
+    DELETE_ROOM_ON_CLOSE = False
 
-SPEECH_ENERGY_THRESHOLD = 0.01
-VAD_ACTIVATION_THRESHOLD = 0.5
+    STT_MODEL = "telephony"
+    STT_LANGUAGE = "hi-IN"
+    TTS_VOICE = "hi-IN-Chirp3-HD-Aoede"
+    TTS_LANGUAGE = "hi-IN"
 
-SESSION_START_TIMEOUT = 2.0
+    LLM_MODEL = "gemini-2.5-flash"
+    LLM_LOCATION = "asia-south1"
+    LLM_PROJECT = "cabswale-ai"
+
+    VAD_MIN_SPEECH_DURATION = 0.25
+    VAD_MIN_SILENCE_DURATION = 0.6
+    VAD_ACTIVATION_THRESHOLD = 0.5
 
 
-class Assistant(Agent):
-    """Raahi voice assistant for cab booking."""
+class RaahiAssistant(Agent):
+    """
+    Raahi voice assistant for cab booking.
+
+    Clean implementation using LiveKit's Agent class.
+    """
 
     def __init__(
         self,
         room: rtc.Room,
         user_profile: UserProfile,
-        nc_manager: Optional[NoiseCancellationManager] = None,
         session_data: Optional[dict] = None,
     ) -> None:
         self.room = room
         self.trip_info = TripDetails()
         self.ui = UIEventManager(room)
         self.user_profile = user_profile
-        self.nc_manager = nc_manager
         self.session_data = session_data or {}
+
+        self._is_paused = False
+        self._pause_reason: Optional[str] = None
 
         formatted_prompt = PROMPT.format(
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M"),
@@ -82,55 +105,93 @@ class Assistant(Agent):
 
         super().__init__(instructions=formatted_prompt)
 
-    async def stt_node(
-        self,
-        audio: AsyncIterable[rtc.AudioFrame],
-        model_settings: ModelSettings
-    ) -> Optional[AsyncIterable[stt.SpeechEvent]]:
-        """STT node with optional noise cancellation."""
-        if self.nc_manager and ENABLE_NOISE_CANCELLATION:
-            async for event in Agent.default.stt_node(
-                self,
-                self._process_audio_with_nc(audio),
-                model_settings
-            ):
-                yield event
-        else:
-            async for event in Agent.default.stt_node(self, audio, model_settings):
-                yield event
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
 
-    async def _process_audio_with_nc(
-        self,
-        audio_stream: AsyncIterable[rtc.AudioFrame]
-    ) -> AsyncIterable[rtc.AudioFrame]:
-        """Apply noise cancellation to audio frames."""
-        async for frame in audio_stream:
-            try:
-                frame_bytes = bytes(frame.data.cast('b'))
-                audio_data = np.frombuffer(frame_bytes, dtype=np.int16).copy()
+    async def send_event(self, event_name: str, data: Optional[dict] = None):
+        """Send event to client."""
+        payload = {
+            "event": event_name,
+            "data": data or {},
+            "timestamp": datetime.utcnow().isoformat(),
+        }
 
-                processed_data, energy = self.nc_manager.process_audio_frame(
-                    audio_data,
-                    sample_rate=frame.sample_rate
-                )
+        await self.room.local_participant.publish_data(
+            payload=json.dumps(payload).encode("utf-8"),
+            topic="session_events",
+            reliable=True,
+        )
+        logger.info(f"Sent event to client: {event_name}")
 
-                yield rtc.AudioFrame(
-                    data=processed_data.tobytes(),
-                    sample_rate=frame.sample_rate,
-                    num_channels=frame.num_channels,
-                    samples_per_channel=frame.samples_per_channel,
-                )
-            except Exception as e:
-                logger.warning(f"NC error: {e}")
-                yield frame
+    async def pause_session(self, session: AgentSession, reason: str = "user_away"):
+        """Pause the session and notify client."""
+        if self._is_paused:
+            return
 
-    async def handle_ui_selection(self, selection: IncomingUserSelection):
+        self._is_paused = True
+        self._pause_reason = reason
+        logger.info(f"Session paused: {reason}")
+
+        await self.send_event(SessionEvent.PAUSED, {
+            "reason": reason,
+            "trip_info": self.trip_info.model_dump(),
+            "message": "Session paused - send resume when ready",
+        })
+
+        await session.say(
+            text="Maaf kijiye, Mai Samajh nahi paa rhi",
+            allow_interruptions=True,
+        )
+
+    async def resume_session(self, session: AgentSession):
+        """Resume the session and notify client."""
+        if not self._is_paused:
+            return
+
+        self._is_paused = False
+        previous_reason = self._pause_reason
+        self._pause_reason = None
+        logger.info(f"Session resumed from: {previous_reason}")
+
+        await self.send_event(SessionEvent.RESUMED, {
+            "trip_info": self.trip_info.model_dump(),
+            "message": "Session resumed",
+        })
+
+        context = self._get_trip_context()
+        await session.say(
+            text=f"Welcome back! {context}",
+            allow_interruptions=True,
+        )
+
+    def _get_trip_context(self) -> str:
+        """Get a brief context of where we left off."""
+        if self.trip_info.pickup and self.trip_info.destination:
+            if not self.trip_info.tripType:
+                return f"Aapka trip {self.trip_info.pickup} se {self.trip_info.destination} ke liye hai. One-way ya round-trip?"
+            elif not self.trip_info.startDate:
+                if self.trip_info.tripType == "round-trip":
+                    return f"Aapka {self.trip_info.tripType} ready hai. Kya aap apni start aur end Date bata sakte hai?"
+                return f"Aapka {self.trip_info.tripType} trip ready hai. Aapko Kab jana hai?"
+            else:
+                return "Aapki trip details ready hain."
+        elif self.trip_info.pickup:
+            return f"Aapne pickup {self.trip_info.pickup} bataya tha. Drop kahan hai?"
+        return "Hum kahan the? Aap apna pickup aur drop city bataiye."
+
+    async def handle_ui_selection(self, session: AgentSession, selection: IncomingUserSelection):
         """Process UI selection from client."""
         if selection.type == "vehicle_type":
             self.trip_info.preferences["vehicle_type"] = selection.value
             self.trip_info.show_vehicle_choices = False
             logger.info(f"Vehicle selected: {selection.value}")
             await self.ui.send_trip_update(self.trip_info)
+
+            await session.generate_reply(
+                instructions=f"""User selected {
+                    selection.value}. Confirm briefly and continue."""
+            )
 
     @function_tool
     async def update_trip(
@@ -155,8 +216,9 @@ class Assistant(Agent):
             self.trip_info.tripType = tripType
         if preferences:
             self.trip_info.preferences.update(preferences)
-        if isinstance(preferences, dict) and preferences.get("vehicle_type"):
-            preferences["vehicleTypesList"] = [preferences["vehicle_type"]]
+            if preferences.get("vehicle_type"):
+                self.trip_info.preferences["vehicleTypesList"] = [
+                    preferences["vehicle_type"]]
         if createTrip is not None:
             self.trip_info.createTrip = createTrip
 
@@ -174,65 +236,46 @@ class Assistant(Agent):
         return "Trip details updated."
 
 
-async def play_session_start_response(
-    session: AgentSession,
-    event_id: str,
-) -> bool:
+async def play_greeting(session: AgentSession, event_id: str) -> bool:
     """
-    Play pre-recorded audio response for session_start event.
+    Play pre-recorded greeting or use TTS fallback.
 
-    Uses session.say() with:
-    - text: transcript (for chat context + TTS fallback)
-    - audio: WAV file stream (if available)
-
-    Returns True if played successfully.
+    Returns True if successful.
     """
     response = get_response(event_id)
-    transcript = response.transcript
     audio_path = response.audio_path if response.exists() else None
 
-    logger.info(f"""Playing response for: {
-                event_id}, audio_exists: {response.exists()}""")
+    logger.info(f"""Playing greeting: {
+                event_id}, has_audio: {response.exists()}""")
 
     try:
         if audio_path and audio_path.exists():
-            logger.info(f"Streaming audio: {audio_path}")
             await session.say(
-                text=transcript,
+                text=response.transcript,
                 audio=stream_wav_file(audio_path),
                 allow_interruptions=False,
                 add_to_chat_ctx=True,
             )
         else:
-            logger.info(f"Using TTS for: {event_id}")
             await session.say(
-                text=transcript,
+                text=response.transcript,
                 allow_interruptions=False,
                 add_to_chat_ctx=True,
             )
         return True
-
     except Exception as e:
-        logger.error(f"Error playing response: {e}")
-        try:
-            await session.say(
-                text=transcript,
-                allow_interruptions=False,
-                add_to_chat_ctx=True,
-            )
-            return True
-        except Exception as e2:
-            logger.error(f"TTS fallback failed: {e2}")
-            return False
+        logger.error(f"Error playing greeting: {e}")
+        return False
 
 
 server = AgentServer()
 
 
 @server.rtc_session()
-async def my_agent(ctx: agents.JobContext):
+async def raahi_agent(ctx: agents.JobContext):
+    """Main agent entrypoint."""
     await ctx.connect()
-    logger.info(f"Agent connected: {ctx.room.name}")
+    logger.info(f"Agent connected to room: {ctx.room.name}")
 
     participant = next(iter(ctx.room.remote_participants.values()), None)
     user_profile = UserProfile()
@@ -242,211 +285,136 @@ async def my_agent(ctx: agents.JobContext):
             meta = json.loads(participant.name)
             user_profile = UserProfile(**meta)
         except Exception as e:
-            logger.warning(f"Failed to parse metadata: {e}")
+            logger.warning(f"Failed to parse user metadata: {e}")
 
-    logger.info(f"Session started for: {user_profile.name}")
+    logger.info(f"Session for: {user_profile.name}")
 
-    # Session state
-    session_ended = asyncio.Event()
+    event_id = DEFAULT_EVENT_ID
+    session_data = {}
     session_start_received = asyncio.Event()
-    pending_event: Optional[ClientEvent] = None
-
-    user_speech_start_time: Optional[float] = None
-    long_utterance_task: Optional[asyncio.Task] = None
-    accumulated_transcript: str = ""
-
-    async def on_timeout(reason: str):
-        logger.warning(f"Session timeout: {reason}")
-        await ctx.room.local_participant.publish_data(
-            json.dumps({"reason": reason, "topic": "timeout"}).encode(),
-            reliable=True,
-        )
-        session_ended.set()
-
-    async def handle_long_utterance():
-        nonlocal accumulated_transcript
-        await asyncio.sleep(MAX_UTTERANCE_DURATION)
-
-        if session and not session_ended.is_set():
-            logger.info(f"Long utterance detected ({MAX_UTTERANCE_DURATION}s)")
-            transcript = accumulated_transcript.strip()
-
-            if transcript:
-                await session.generate_reply(
-                    instructions=f"""User spoke for too long: "{transcript}"
-                    Extract any trip info and continue. Keep response SHORT."""
-                )
-            else:
-                await session.generate_reply(
-                    instructions="User was speaking but unclear. Ask: 'Sorry, aap dobara bataiye?'"
-                )
-
-    nc_config = NoiseCancellationConfig(
-        enabled=ENABLE_NOISE_CANCELLATION and NOISEREDUCE_AVAILABLE,
-        noise_reduction_strength=NOISE_REDUCTION_STRENGTH,
-        silence_timeout_seconds=SILENCE_TIMEOUT,
-        noise_flood_timeout_seconds=NOISE_FLOOD_TIMEOUT,
-        speech_energy_threshold=SPEECH_ENERGY_THRESHOLD,
-        agent_speaking_grace_seconds=5.0,
-    )
-
-    nc_manager = NoiseCancellationManager(
-        config=nc_config,
-        on_timeout=on_timeout,
-    )
-
-    session = AgentSession(
-        stt=google.STT(model="telephony", languages="hi-IN"),
-        llm=google.LLM(
-            model="gemini-2.5-flash",
-            vertexai=True,
-            location="asia-south1",
-            project="cabswale-ai",
-        ),
-        tts=StreamAdapter(
-            tts=google.TTS(
-                voice_name="hi-IN-Chirp3-HD-Aoede",
-                language="hi-IN",
-                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            ),
-            sentence_tokenizer=tokenize.basic.SentenceTokenizer(),
-        ),
-        vad=silero.VAD.load(
-            min_speech_duration=0.25,
-            min_silence_duration=0.6,
-            prefix_padding_duration=0.3,
-            activation_threshold=VAD_ACTIVATION_THRESHOLD,
-            sample_rate=16000,
-            force_cpu=True,
-        ),
-        turn_detection=MultilingualModel(),
-        user_away_timeout=300.0,
-    )
-
-    @session.on("user_input_transcribed")
-    def on_transcription(ev):
-        nonlocal accumulated_transcript
-        transcript = getattr(ev, 'transcript', '') or ''
-        if len(transcript.strip()) > 1:
-            nc_manager.on_stt_result(transcript)
-            accumulated_transcript += " " + transcript
-
-    @session.on("user_speech_started")
-    def on_user_speech_started(ev):
-        nonlocal user_speech_start_time, long_utterance_task, accumulated_transcript
-        user_speech_start_time = time.time()
-        accumulated_transcript = ""
-        if long_utterance_task and not long_utterance_task.done():
-            long_utterance_task.cancel()
-        long_utterance_task = asyncio.create_task(handle_long_utterance())
-
-    @session.on("user_speech_committed")
-    def on_user_speech_committed(ev):
-        nonlocal long_utterance_task, accumulated_transcript
-        if long_utterance_task and not long_utterance_task.done():
-            long_utterance_task.cancel()
-        accumulated_transcript = ""
-
-    @session.on("agent_speech_started")
-    def on_agent_speech_started(ev):
-        nonlocal long_utterance_task
-        nc_manager.on_agent_speech()
-        if long_utterance_task and not long_utterance_task.done():
-            long_utterance_task.cancel()
-
-    @session.on("agent_speech_stopped")
-    def on_agent_speech_stopped(ev):
-        nc_manager.on_agent_speech()
 
     @ctx.room.on("data_received")
-    def on_data(data: rtc.DataPacket):
-        nonlocal pending_event
+    def on_session_start(data: rtc.DataPacket):
+        nonlocal event_id, session_data
 
         if not data.participant:
             return
 
         try:
             payload = json.loads(data.data.decode("utf-8"))
-
             if payload.get("name") == "session_start":
                 event = ClientEvent(**payload)
-                pending_event = event
+                event_id = event.event_id
+                session_data = event.data
                 session_start_received.set()
-                logger.info(f"Received session_start: {event.event_id}")
-                return
-
-            if payload.get("event") == "user_selection":
-                nc_manager.metrics.on_stt_result()
-                selection = IncomingUserSelection(**payload)
-                asyncio.create_task(handle_selection(selection))
-
+                logger.info(f"Received session_start: {event_id}")
         except Exception as e:
-            logger.error(f"Data processing error: {e}")
-
-    async def handle_selection(selection: IncomingUserSelection):
-        await agent_instance.handle_ui_selection(selection)
-        await session.generate_reply(
-            instructions=f"""User selected {
-                selection.value}. Confirm briefly and continue."""
-        )
-
-    await nc_manager.start()
-
-    event_id = DEFAULT_EVENT_ID
-    session_data = {}
+            logger.error(f"session_start parsing error: {e}")
 
     try:
-        await asyncio.wait_for(
-            session_start_received.wait(),
-            timeout=SESSION_START_TIMEOUT
-        )
-        if pending_event:
-            event_id = pending_event.event_id
-            session_data = pending_event.data
-            logger.info(f"Using event_id: {event_id}, data: {session_data}")
+        await asyncio.wait_for(session_start_received.wait(), timeout=2.0)
     except asyncio.TimeoutError:
         logger.info(f"No session_start received, using default: {event_id}")
 
-    agent_instance = Assistant(
+    assistant = RaahiAssistant(
         room=ctx.room,
         user_profile=user_profile,
-        nc_manager=nc_manager,
         session_data=session_data,
     )
 
+    session = AgentSession(
+        stt=google.STT(model=Config.STT_MODEL, languages=Config.STT_LANGUAGE),
+        llm=google.LLM(
+            model=Config.LLM_MODEL,
+            vertexai=True,
+            location=Config.LLM_LOCATION,
+            project=Config.LLM_PROJECT,
+        ),
+        tts=StreamAdapter(
+            tts=google.TTS(
+                voice_name=Config.TTS_VOICE,
+                language=Config.TTS_LANGUAGE,
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            ),
+            sentence_tokenizer=tokenize.basic.SentenceTokenizer(),
+        ),
+        vad=silero.VAD.load(
+            min_speech_duration=Config.VAD_MIN_SPEECH_DURATION,
+            min_silence_duration=Config.VAD_MIN_SILENCE_DURATION,
+            activation_threshold=Config.VAD_ACTIVATION_THRESHOLD,
+            sample_rate=16000,
+            force_cpu=True,
+        ),
+        turn_detection=MultilingualModel(),
+        # Key setting: timeout before user is considered "away"
+        user_away_timeout=Config.USER_AWAY_TIMEOUT,
+    )
+
+    @session.on("user_state_changed")
+    def on_user_state_changed(event: UserStateChangedEvent):
+        logger.info(f"User state: {event.old_state} -> {event.new_state}")
+
+        if event.new_state == "away":
+            asyncio.create_task(assistant.pause_session(session, "user_away"))
+        elif event.old_state == "away" and event.new_state in ("speaking", "listening"):
+            if assistant.is_paused:
+                asyncio.create_task(assistant.resume_session(session))
+
+    @ctx.room.on("data_received")
+    def on_data_received_handler(data: rtc.DataPacket):
+        if not data.participant:
+            return
+
+        try:
+            payload = json.loads(data.data.decode("utf-8"))
+            event_name = payload.get("name") or payload.get("event")
+
+            if event_name == "session_start":
+                return
+
+            if event_name == SessionEvent.RESUME_REQUEST:
+                logger.info("Client requested resume")
+                if assistant.is_paused:
+                    asyncio.create_task(assistant.resume_session(session))
+                return
+
+            if event_name == "user_selection":
+                selection = IncomingUserSelection(**payload)
+                asyncio.create_task(
+                    assistant.handle_ui_selection(session, selection))
+                return
+
+        except Exception as e:
+            logger.error(f"Data handling error: {e}")
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant):
+        logger.info(f"Participant disconnected: {participant.identity}")
+        if not assistant.is_paused:
+            asyncio.create_task(assistant.pause_session(
+                session, "user_disconnected"))
+
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant: rtc.RemoteParticipant):
+        logger.info(f"Participant connected: {participant.identity}")
+
     await session.start(
         room=ctx.room,
-        agent=agent_instance,
+        agent=assistant,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(),
+            close_on_disconnect=Config.CLOSE_ON_DISCONNECT,
+            delete_room_on_close=Config.DELETE_ROOM_ON_CLOSE,
         ),
     )
 
-    played = await play_session_start_response(session, event_id)
-
-    if not played:
+    if not await play_greeting(session, event_id):
         await session.generate_reply(
             instructions="Greet: 'Namaste, mai Raahi hoon. Aap apna pickup aur drop city bataiye.'",
             allow_interruptions=False
         )
 
-    try:
-        await session_ended.wait()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        if long_utterance_task and not long_utterance_task.done():
-            long_utterance_task.cancel()
-
-        await nc_manager.stop()
-        logger.info(f"Session stats: {nc_manager.get_stats()}")
-
-        try:
-            await ctx.room.disconnect()
-        except Exception:
-            pass
-
-        logger.info("Session ended")
+    logger.info("Agent session running...")
 
 
 if __name__ == "__main__":

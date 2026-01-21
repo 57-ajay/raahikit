@@ -33,7 +33,7 @@ Rules:
 - Never ask multiple questions (EXCEPTION: You MUST ask for pickup and Destination together).
 
 Completion sentence (MUST MATCH EXACTLY):
-"Maine aapki trip request create kardi hai, ab aap drivers ki quotations dekh sakte hai and unse connect kar sakte hai"
+"Maine aapki trip create kardi hai, ab aap drivers ki quotations dekh sakte hai and unse connect kar sakte hai"
 </PERSONA>
 
 <TRIP_STATE_MODEL>
