@@ -31,7 +31,7 @@ logger = logging.getLogger("raahi-agent")
 USER_AWAY_TIMEOUT = 30.0              # Built-in LiveKit timeout (backup)
 SILENCE_TIMEOUT = 30.0                # No audio energy at all
 NOISE_FLOOD_TIMEOUT = 30.0            # Audio but no valid STT
-MAX_UTTERANCE_DURATION = 15.0
+MAX_UTTERANCE_DURATION = 30.0
 
 ENABLE_NOISE_CANCELLATION = True
 NOISE_REDUCTION_STRENGTH = 0.7        # 0.0-1.0, higher = more aggressive
@@ -395,7 +395,8 @@ async def my_agent(ctx: agents.JobContext):
 
     await session.generate_reply(
         instructions="""Greet warmly: 'Namaste, mai Raahi. main Aap ki trip create karne mai madad kar sakti hu'
-        Then ask: 'Aap apna pickup aur drop city bataiye.'"""
+        Then ask: 'Aap apna pickup aur drop city bataiye.'""",
+        allow_interruptions=False
     )
 
     try:
