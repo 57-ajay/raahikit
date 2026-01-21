@@ -3,15 +3,41 @@ from typing import Optional, Dict, Any
 from enum import Enum
 
 
+# =============================================================================
+# STANDARD EVENT SCHEMA
+# =============================================================================
+# All client events follow this format:
+# {
+#     "name": "event_name",
+#     "event_id": "SOME_ID",
+#     "data": { ... }
+# }
+# =============================================================================
+
+class ClientEvent(BaseModel):
+    """Standard event schema from client."""
+    name: str
+    event_id: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionStartEvent(ClientEvent):
+    """Event fired when session starts - triggers pre-recorded audio."""
+    name: str = "session_start"
+
+
 class UIEventType(str, Enum):
     TRIP_UPDATE = "trip_update"
 
 
+class UIEventPayload(BaseModel):
+    event: UIEventType
+    details: Dict[str, Any]
+    timestamp: str
+
+
 class UserProfile(BaseModel):
-    """
-    Modular user profile. Add fields here to extend user context.
-    Client should send this as JSON in participant metadata.
-    """
+    """User profile from participant metadata."""
     name: str = "Cabswale Traveller"
     phone_number: str = "Unknown"
     extra_data: Dict[str, Any] = Field(default_factory=dict)
@@ -24,6 +50,7 @@ class TripDetails(BaseModel):
     endDate: Optional[str] = None
     tripType: Optional[str] = None
     createTrip: bool = False
+    show_vehicle_choices: bool = False
 
     preferences: Dict[str, Any] = Field(
         default_factory=lambda: {
@@ -44,12 +71,6 @@ class TripDetails(BaseModel):
             "fuelType": None
         }
     )
-
-
-class UIEventPayload(BaseModel):
-    event: UIEventType
-    details: Dict[str, Any]
-    timestamp: str
 
 
 class UserSelectionType(str, Enum):
