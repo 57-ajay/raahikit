@@ -45,7 +45,9 @@ RUN uv pip install --system \
     numpy
 
 COPY ./AUDIO_DIR ./AUDIO_DIR
-COPY main.py server.py prompt.py schemas.py events.py noise_cancellation.py audio_player.py audio_responses.py ./
+COPY main.py server.py prompt.py schemas.py \
+    events.py noise_cancellation.py audio_player.py \
+    audio_responses.py session_monitor.py audio_processor.py ./
 
 RUN python main.py download-files
 

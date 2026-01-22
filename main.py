@@ -1,13 +1,3 @@
-"""
-Raahi Voice Agent - Clean Implementation
-
-Uses LiveKit's built-in features:
-- user_away_timeout for idle detection
-- user_state_changed event for handling user away/back
-- close_on_disconnect=False for session persistence
-- Built-in reconnection handling
-"""
-
 import logging
 import json
 import asyncio
@@ -30,11 +20,9 @@ from events import UIEventManager
 from schemas import TripDetails, IncomingUserSelection, UserProfile, ClientEvent, ChatMessage
 from audio_responses import get_response, DEFAULT_EVENT_ID
 from audio_player import stream_wav_file
+from session_monitor import SessionMonitor, SessionMonitorConfig, PauseReason
+from audio_processor import VADEventBridge, AudioEnergyCalculator
 
-
-# =============================================================================
-# SESSION STATE EVENTS (Agent <-> Client)
-# =============================================================================
 
 class SessionEvent:
     """Events sent between agent and client."""
@@ -59,6 +47,7 @@ class Config:
 
     STT_MODEL = "telephony"
     STT_LANGUAGE = "hi-IN"
+
     TTS_VOICE = "hi-IN-Chirp3-HD-Aoede"
     TTS_LANGUAGE = "hi-IN"
 
@@ -70,12 +59,18 @@ class Config:
     VAD_MIN_SILENCE_DURATION = 0.6
     VAD_ACTIVATION_THRESHOLD = 0.5
 
+    SILENCE_TIMEOUT = 30.0
+    NOISE_WITHOUT_STT_TIMEOUT = 15.0
+    CONTINUOUS_SPEECH_TIMEOUT = 30.0
+    NOISE_ENERGY_THRESHOLD = 0.02
+
 
 class RaahiAssistant(Agent):
     """
     Raahi voice assistant for cab booking.
 
-    Clean implementation using LiveKit's Agent class.
+    Clean implementation using LiveKit's Agent class with
+    intelligent session monitoring.
     """
 
     def __init__(
@@ -93,6 +88,12 @@ class RaahiAssistant(Agent):
         self._is_paused = False
         self._pause_reason: Optional[str] = None
         self._chat_history: list[ChatMessage] = []
+        self._session: Optional[AgentSession] = None
+
+        self._session_monitor: Optional[SessionMonitor] = None
+
+        self._vad_bridge: Optional[VADEventBridge] = None
+        self._energy_calculator = AudioEnergyCalculator()
 
         formatted_prompt = PROMPT.format(
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M"),
@@ -109,6 +110,57 @@ class RaahiAssistant(Agent):
     @property
     def is_paused(self) -> bool:
         return self._is_paused
+
+    def set_session(self, session: AgentSession):
+        """Set the agent session reference."""
+        self._session = session
+
+    async def setup_session_monitor(self):
+        """Initialize and start the session monitor with VAD bridge."""
+        config = SessionMonitorConfig(
+            silence_timeout_seconds=Config.SILENCE_TIMEOUT,
+            noise_without_stt_timeout_seconds=Config.NOISE_WITHOUT_STT_TIMEOUT,
+            continuous_speech_timeout_seconds=Config.CONTINUOUS_SPEECH_TIMEOUT,
+            noise_energy_threshold=Config.NOISE_ENERGY_THRESHOLD,
+            agent_speaking_grace_seconds=5.0,
+            post_agent_grace_seconds=3.0,
+            min_valid_utterance_length=3,
+            max_fragmented_utterances=5,
+        )
+
+        self._session_monitor = SessionMonitor(
+            config=config,
+            on_pause_triggered=self._on_monitor_pause_triggered,
+        )
+
+        self._vad_bridge = VADEventBridge(
+            on_speech_start=self._on_vad_speech_start,
+            on_speech_end=self._on_vad_speech_end,
+            on_audio_frame=self.on_audio_frame,
+        )
+
+        await self._session_monitor.start()
+        logger.info("Session monitor and VAD bridge initialized")
+
+    def _on_vad_speech_start(self):
+        """Called when VAD detects speech start."""
+        pass
+
+    def _on_vad_speech_end(self):
+        """Called when VAD detects speech end."""
+        pass
+
+    async def stop_session_monitor(self):
+        """Stop the session monitor."""
+        if self._session_monitor:
+            await self._session_monitor.stop()
+
+    async def _on_monitor_pause_triggered(self, reason: PauseReason, message: str):
+        """Called when session monitor detects a pause condition."""
+        logger.info(f"Monitor triggered pause: {reason.value} - {message}")
+
+        if self._session and not self._is_paused:
+            await self.pause_session(self._session, reason.value)
 
     def log_user(self, text: str):
         """Log user message to chat history."""
@@ -140,51 +192,97 @@ class RaahiAssistant(Agent):
         logger.info(f"Sent event to client: {event_name}")
 
     async def pause_session(self, session: AgentSession, reason: str = "user_away"):
-        """Pause the session and notify client."""
+        """Pause the session and notify client. Agent stops all processing."""
         if self._is_paused:
             return
 
+        logger.info(f"Session pausing: {reason}")
+
+        if self._session_monitor:
+            self._session_monitor.pause()
+
+        try:
+            session.interrupt()
+            logger.debug("Interrupted ongoing agent activity")
+        except Exception as e:
+            logger.debug(f"No activity to interrupt: {e}")
+
+        pause_messages = {
+            "user_away": "Aap wapas aayein tab baat karte hain.",
+            "noisy_environment": "Bahut shor hai, shant jagah mein baat karein.",
+            "user_talking_to_others": "Lagta hai aap kisi aur se baat kar rahe hain. Jab free hon tab bolein.",
+            "noise_flood": "Awaz theek se nahi aa rahi. Please check your microphone.",
+            "silence_timeout": "Koi response nahi mila. Jab ready hon tab bolein.",
+            "user_disconnected": "Connection lost. Reconnect hone par baat karenge.",
+        }
+
+        message = pause_messages.get(
+            reason, "Session paused. Resume when ready.")
+
+        try:
+            await session.say(
+                text=message,
+                allow_interruptions=False,
+            )
+        except Exception as e:
+            logger.warning(f"Could not say pause message: {e}")
+
         self._is_paused = True
         self._pause_reason = reason
-        logger.info(f"Session paused: {reason}")
 
         await self.send_event(SessionEvent.PAUSED, {
             "reason": reason,
             "trip_info": self.trip_info.model_dump(),
-            "message": "Session paused - send resume when ready",
+            "message": message,
         })
 
-        await session.say(
-            text="Maaf kijiye, Mai Samajh nahi paa rhi",
-            allow_interruptions=True,
-        )
+        logger.info(
+            f"Agent is now PAUSED - will not respond until client sends resume event")
 
     async def resume_session(self, session: AgentSession):
         """Resume the session and notify client."""
+        logger.info(f"resume_session called, is_paused: {self._is_paused}")
+
         if not self._is_paused:
+            logger.debug("Resume called but session is not paused")
             return
 
-        self._is_paused = False
+        logger.info(f"Session resuming from: {self._pause_reason}")
+
         previous_reason = self._pause_reason
+        self._is_paused = False
         self._pause_reason = None
-        logger.info(f"Session resumed from: {previous_reason}")
+
+        logger.info(f"Flags reset, is_paused now: {self._is_paused}")
+
+        if self._session_monitor:
+            self._session_monitor.resume()
+            logger.debug("Session monitor resumed")
 
         await self.send_event(SessionEvent.RESUMED, {
             "trip_info": self.trip_info.model_dump(),
             "message": "Session resumed",
         })
+        logger.info("Sent RESUMED event to client")
 
         context = self._get_trip_context()
-        await session.say(
-            text=f"Welcome back! {context}",
-            allow_interruptions=True,
-        )
+        logger.info(f"About to say welcome back message: {context[:50]}...")
+        try:
+            await session.say(
+                text=f"Welcome back! {context}",
+                allow_interruptions=True,
+            )
+            logger.info("Welcome back message spoken successfully")
+        except Exception as e:
+            logger.error(f"Could not say resume message: {e}", exc_info=True)
+
+        logger.info("Session RESUMED - agent is now active")
 
     def _get_trip_context(self) -> str:
         """Get a brief context of where we left off."""
         if self.trip_info.pickup and self.trip_info.destination:
             if not self.trip_info.tripType:
-                return f"Aapka trip {self.trip_info.pickup} se {self.trip_info.destination} ke liye hai. One-way ya round-trip?"
+                return f"Aapka trip {self.trip_info.pickup} se {self.trip_info.destination} ke liye hai, One-way ya round-trip?"
             elif not self.trip_info.startDate:
                 if self.trip_info.tripType == "round-trip":
                     return f"Aapka {self.trip_info.tripType} ready hai, Kya aap apni start aur end Date bata sakte hai?"
@@ -207,6 +305,59 @@ class RaahiAssistant(Agent):
                 instructions=f"""User selected {
                     selection.value}. Confirm briefly and continue."""
             )
+
+    def on_audio_frame(self, energy: float, is_speech: bool):
+        """Forward audio frame data to session monitor."""
+        if self._session_monitor:
+            self._session_monitor.on_audio_frame(energy, is_speech)
+
+    def on_stt_result(self, transcript: str, is_final: bool):
+        """Forward STT result to session monitor."""
+        if self._session_monitor:
+            self._session_monitor.on_stt_result(transcript, is_final)
+
+    def on_agent_speech_start(self):
+        """Notify session monitor that agent started speaking."""
+        if self._session_monitor:
+            self._session_monitor.on_agent_speech_start()
+
+    def on_agent_speech_end(self):
+        """Notify session monitor that agent finished speaking."""
+        if self._session_monitor:
+            self._session_monitor.on_agent_speech_end()
+
+    async def handle_audio_track(self, track: rtc.Track, participant: rtc.RemoteParticipant):
+        """
+        Subscribe to audio track and process frames for energy monitoring.
+
+        This allows us to detect noisy environments even when VAD doesn't trigger.
+        """
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+
+        logger.info(f"Subscribing to audio track from {participant.identity}")
+
+        audio_stream = rtc.AudioStream(track)
+
+        try:
+            async for frame_event in audio_stream:
+                if self._is_paused:
+                    continue
+
+                energy = self._energy_calculator.calculate_energy(
+                    frame_event.frame.data.tobytes()
+                    if hasattr(frame_event.frame.data, 'tobytes')
+                    else bytes(frame_event.frame.data),
+                    sample_width=2
+                )
+
+                is_speech_like = energy > Config.NOISE_ENERGY_THRESHOLD
+                self.on_audio_frame(energy, is_speech_like)
+
+        except Exception as e:
+            logger.error(f"Audio track processing error: {e}")
+        finally:
+            logger.info("Audio track processing ended")
 
     @function_tool
     async def update_trip(
@@ -366,27 +517,39 @@ async def raahi_agent(ctx: agents.JobContext):
             force_cpu=True,
         ),
         turn_detection=MultilingualModel(),
-        # Key setting: timeout before user is considered "away"
         user_away_timeout=Config.USER_AWAY_TIMEOUT,
     )
+
+    assistant.set_session(session)
+    await assistant.setup_session_monitor()
+
+    async def should_process_input() -> bool:
+        """Check if we should process user input."""
+        return not assistant.is_paused
 
     @session.on("user_state_changed")
     def on_user_state_changed(event: UserStateChangedEvent):
         logger.info(f"User state: {event.old_state} -> {event.new_state}")
 
-        if event.new_state == "away":
+        if event.new_state == "away" and not assistant.is_paused:
             asyncio.create_task(assistant.pause_session(session, "user_away"))
-        elif event.old_state == "away" and event.new_state in ("speaking", "listening"):
-            if assistant.is_paused:
-                asyncio.create_task(assistant.resume_session(session))
 
     @session.on("user_input_transcribed")
-    def on_user_input(event):
+    def on_user_input(event: UserInputTranscribedEvent):
+        if assistant.is_paused:
+            logger.debug("Ignoring STT input - session is paused")
+            return
+
+        assistant.on_stt_result(event.transcript, event.is_final)
+
         if event.is_final and event.transcript:
             assistant.log_user(event.transcript)
 
     @session.on("conversation_item_added")
-    def on_conversation_item(event):
+    def on_conversation_item(event: ConversationItemAddedEvent):
+        if assistant.is_paused:
+            return
+
         item = event.item
         role = "agent" if item.role == "assistant" else item.role
         text = item.text_content if hasattr(
@@ -394,6 +557,36 @@ async def raahi_agent(ctx: agents.JobContext):
 
         if role == "agent" and text:
             assistant.log_agent(text)
+
+    @session.on("agent_speech_started")
+    def on_agent_speech_started():
+        if not assistant.is_paused:
+            assistant.on_agent_speech_start()
+
+    @session.on("agent_speech_stopped")
+    def on_agent_speech_stopped():
+        if not assistant.is_paused:
+            assistant.on_agent_speech_end()
+
+    @session.on("user_started_speaking")
+    def on_user_started_speaking():
+        """VAD detected user started speaking."""
+        if assistant.is_paused:
+            logger.debug("Ignoring VAD start - session is paused")
+            return
+        logger.debug("VAD: User started speaking")
+        if assistant._vad_bridge:
+            assistant._vad_bridge.handle_vad_start()
+
+    @session.on("user_stopped_speaking")
+    def on_user_stopped_speaking():
+        """VAD detected user stopped speaking."""
+        if assistant.is_paused:
+            logger.debug("Ignoring VAD stop - session is paused")
+            return
+        logger.debug("VAD: User stopped speaking")
+        if assistant._vad_bridge:
+            assistant._vad_bridge.handle_vad_end()
 
     @ctx.room.on("data_received")
     def on_data_received_handler(data: rtc.DataPacket):
@@ -404,23 +597,33 @@ async def raahi_agent(ctx: agents.JobContext):
             payload = json.loads(data.data.decode("utf-8"))
             event_name = payload.get("name") or payload.get("event")
 
+            logger.info(f"""Received data event: {
+                        event_name}, paused: {assistant.is_paused}""")
+
             if event_name == "session_start":
                 return
 
-            if event_name == SessionEvent.RESUME_REQUEST:
-                logger.info("Client requested resume")
+            if event_name == SessionEvent.RESUME_REQUEST or event_name == "session_resume":
+                logger.info(f"""Client requested resume, is_paused: {
+                            assistant.is_paused}""")
                 if assistant.is_paused:
+                    logger.info("Triggering resume_session...")
                     asyncio.create_task(assistant.resume_session(session))
+                else:
+                    logger.info("Session not paused, ignoring resume request")
                 return
 
             if event_name == "user_selection":
+                if assistant.is_paused:
+                    logger.debug("Ignoring user_selection - session is paused")
+                    return
                 selection = IncomingUserSelection(**payload)
                 asyncio.create_task(
                     assistant.handle_ui_selection(session, selection))
                 return
 
         except Exception as e:
-            logger.error(f"Data handling error: {e}")
+            logger.error(f"Data handling error: {e}", exc_info=True)
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -432,6 +635,18 @@ async def raahi_agent(ctx: agents.JobContext):
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info(f"Participant connected: {participant.identity}")
+
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant
+    ):
+        """Handle track subscription to process audio for energy monitoring."""
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info(f"Audio track subscribed from {participant.identity}")
+            asyncio.create_task(
+                assistant.handle_audio_track(track, participant))
 
     await session.start(
         room=ctx.room,
@@ -450,6 +665,13 @@ async def raahi_agent(ctx: agents.JobContext):
         )
 
     logger.info("Agent session running...")
+
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        await assistant.stop_session_monitor()
+        raise
 
 
 if __name__ == "__main__":
