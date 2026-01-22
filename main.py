@@ -172,8 +172,8 @@ class RaahiAssistant(Agent):
                 return f"Aapka trip {self.trip_info.pickup} se {self.trip_info.destination} ke liye hai. One-way ya round-trip?"
             elif not self.trip_info.startDate:
                 if self.trip_info.tripType == "round-trip":
-                    return f"Aapka {self.trip_info.tripType} ready hai. Kya aap apni start aur end Date bata sakte hai?"
-                return f"Aapka {self.trip_info.tripType} trip ready hai. Aapko Kab jana hai?"
+                    return f"Aapka {self.trip_info.tripType} ready hai, Kya aap apni start aur end Date bata sakte hai?"
+                return f"Aapka {self.trip_info.tripType} trip ready hai, Aapko Kab jana hai?"
             else:
                 return "Aapki trip details ready hain."
         elif self.trip_info.pickup:
