@@ -203,6 +203,7 @@ class RaahiAssistant(Agent):
         tripType: Optional[str] = None,
         preferences: Optional[dict] = None,
         endDate: Optional[str] = None,
+        preferencesAsked: Optional[bool] = None,
         createTrip: Optional[bool] = False,
     ):
         """Updates trip details and syncs with UI."""
@@ -219,6 +220,8 @@ class RaahiAssistant(Agent):
             if preferences.get("vehicle_type"):
                 self.trip_info.preferences["vehicleTypesList"] = [
                     preferences["vehicle_type"]]
+        if preferencesAsked is not None:
+            self.trip_info.preferencesAsked = preferencesAsked
         if createTrip is not None:
             self.trip_info.createTrip = createTrip
 

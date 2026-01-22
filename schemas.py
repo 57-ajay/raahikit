@@ -51,6 +51,7 @@ class TripDetails(BaseModel):
     tripType: Optional[str] = None
     createTrip: bool = False
     show_vehicle_choices: bool = False
+    preferencesAsked: bool = False
 
     preferences: Dict[str, Any] = Field(
         default_factory=lambda: {
@@ -69,7 +70,7 @@ class TripDetails(BaseModel):
             "age": None,
             "withCarrier": None,
             "fuelType": None,
-            "extraPreferences": Any
+            "extraPreferences": None
         }
     )
 
