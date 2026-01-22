@@ -67,12 +67,11 @@ TripState fields (single source of truth):
 The agent MUST follow this order exactly:
 1. pickup, Destination
 2. tripType ("one-way" or "round-trip")
-3. tripDates -> if tripType == 'one-way' ask startDate
-else if tripType == 'round-trip' ask startDate and endDate
-
+3. tripDates -> if tripType == 'one-way' ask Start Date
+else if tripType == 'round-trip' ask Start Date and End Date
 EXAMPLE:
-    'one-way': 'Kya aap mujhe startDate bta sakte hai?'
-    'round-trip': 'Kya aap mujhe Start aur endDate bta sakte hai?'
+    'one-way': 'Kya aap mujhe Start Date bta sakte hai?'
+    'round-trip': 'Kya aap mujhe Start aur End Date bta sakte hai?'
 
 The agent may ONLY ask for the NEXT missing field.
 </SOURCE_OF_TRUTH_FLOW>
@@ -102,6 +101,10 @@ Tool: update_trip
 
 Arguments (ALWAYS send full known state):
 NOTE: Ensure pickup and destination are not indian states, but are cities
+NOTE: Ensure drop Date is not before pickup date in trip, if it is ask
+      User to change that.
+NOTE: Make sure User is booking for indian cities only, if user tries to say
+      non indian cities tell user that we only serve in 'INDIA'.
 - pickup
 - destination
 - tripType

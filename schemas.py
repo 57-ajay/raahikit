@@ -68,7 +68,8 @@ class TripDetails(BaseModel):
             "connections": None,
             "age": None,
             "withCarrier": None,
-            "fuelType": None
+            "fuelType": None,
+            "extraPreferences": Any
         }
     )
 
