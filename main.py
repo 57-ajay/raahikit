@@ -19,7 +19,7 @@ from google.cloud import texttospeech
 from livekit import agents, rtc
 from livekit.agents import (
     AgentServer, AgentSession, Agent, room_io, function_tool, RunContext,
-    tokenize, UserStateChangedEvent
+    tokenize, UserStateChangedEvent, UserInputTranscribedEvent, ConversationItemAddedEvent
 )
 from livekit.agents.tts import StreamAdapter
 from livekit.plugins import google, silero
@@ -27,7 +27,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from prompt import PROMPT
 from events import UIEventManager
-from schemas import TripDetails, IncomingUserSelection, UserProfile, ClientEvent
+from schemas import TripDetails, IncomingUserSelection, UserProfile, ClientEvent, ChatMessage
 from audio_responses import get_response, DEFAULT_EVENT_ID
 from audio_player import stream_wav_file
 
@@ -92,6 +92,7 @@ class RaahiAssistant(Agent):
 
         self._is_paused = False
         self._pause_reason: Optional[str] = None
+        self._chat_history: list[ChatMessage] = []
 
         formatted_prompt = PROMPT.format(
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M"),
@@ -108,6 +109,20 @@ class RaahiAssistant(Agent):
     @property
     def is_paused(self) -> bool:
         return self._is_paused
+
+    def log_user(self, text: str):
+        """Log user message to chat history."""
+        if text and text.strip():
+            self._chat_history.append(
+                ChatMessage(role="user", text=text.strip()))
+            logger.debug(f"Logged user: {text[:50]}...")
+
+    def log_agent(self, text: str):
+        """Log agent message to chat history."""
+        if text and text.strip():
+            self._chat_history.append(ChatMessage(
+                role="agent", text=text.strip()))
+            logger.debug(f"Logged agent: {text[:50]}...")
 
     async def send_event(self, event_name: str, data: Optional[dict] = None):
         """Send event to client."""
@@ -224,6 +239,8 @@ class RaahiAssistant(Agent):
             self.trip_info.preferencesAsked = preferencesAsked
         if createTrip is not None:
             self.trip_info.createTrip = createTrip
+            if createTrip:
+                self.trip_info.chatHistory = self._chat_history.copy()
 
         if tripType == "one-way" and startDate and not endDate:
             try:
@@ -362,6 +379,21 @@ async def raahi_agent(ctx: agents.JobContext):
         elif event.old_state == "away" and event.new_state in ("speaking", "listening"):
             if assistant.is_paused:
                 asyncio.create_task(assistant.resume_session(session))
+
+    @session.on("user_input_transcribed")
+    def on_user_input(event):
+        if event.is_final and event.transcript:
+            assistant.log_user(event.transcript)
+
+    @session.on("conversation_item_added")
+    def on_conversation_item(event):
+        item = event.item
+        role = "agent" if item.role == "assistant" else item.role
+        text = item.text_content if hasattr(
+            item, 'text_content') else str(item.content)
+
+        if role == "agent" and text:
+            assistant.log_agent(text)
 
     @ctx.room.on("data_received")
     def on_data_received_handler(data: rtc.DataPacket):

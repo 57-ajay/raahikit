@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from enum import Enum
 
 
@@ -43,6 +43,11 @@ class UserProfile(BaseModel):
     extra_data: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ChatMessage(BaseModel):
+    role: str  # "user" or "agent"
+    text: str
+
+
 class TripDetails(BaseModel):
     pickup: Optional[str] = None
     destination: Optional[str] = None
@@ -52,6 +57,7 @@ class TripDetails(BaseModel):
     createTrip: bool = False
     show_vehicle_choices: bool = False
     preferencesAsked: bool = False
+    chatHistory: List[ChatMessage] = Field(default_factory=list)
 
     preferences: Dict[str, Any] = Field(
         default_factory=lambda: {
