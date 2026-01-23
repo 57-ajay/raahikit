@@ -3,6 +3,7 @@ import json
 import asyncio
 from typing import Optional
 from datetime import datetime, timedelta
+import numpy as np
 
 from dotenv import load_dotenv
 from google.cloud import texttospeech
@@ -23,20 +24,17 @@ from audio_player import stream_wav_file
 from session_monitor import SessionMonitor, SessionMonitorConfig, PauseReason
 from audio_processor import VADEventBridge, AudioEnergyCalculator
 
+# Import noise cancellation
 from noise_cancellation import (
-    create_noise_cancellation_processor,
-    NoiseConfig,
-    diagnose_setup,
+    NoiseCancellationManager,
+    NoiseCancellationConfig,
 )
 
 
 class SessionEvent:
     """Events sent between agent and client."""
-    # Agent -> Client
     PAUSED = "session_paused"
     RESUMED = "session_resumed"
-
-    # Client -> Agent
     RESUME_REQUEST = "session_resume"
 
 
@@ -74,18 +72,16 @@ class Config:
 
     # Noise cancellation settings
     NC_ENABLED = True
-    NC_STRENGTH = 0.6  # 0.0-1.0, higher = more aggressive reduction
-    NC_STATIONARY = False  # False = better for varying real-world noise
-    NC_HIGHPASS_HZ = 80  # Remove low-frequency rumble (traffic, AC, etc.)
-    NC_TIME_CONSTANT = 0.4  # Adaptation speed (lower = faster)
+    NC_STRENGTH = 0.7
+    NC_SILENCE_TIMEOUT = 15.0
+    NC_NOISE_FLOOD_TIMEOUT = 15.0
+    NC_SPEECH_ENERGY_THRESHOLD = 0.01
+    NC_AGENT_GRACE_SECONDS = 5.0
 
 
 class RaahiAssistant(Agent):
     """
     Raahi voice assistant for cab booking.
-
-    Clean implementation using LiveKit's Agent class with
-    intelligent session monitoring and noise cancellation.
     """
 
     def __init__(
@@ -105,7 +101,6 @@ class RaahiAssistant(Agent):
         self._chat_history: list[ChatMessage] = []
         self._session: Optional[AgentSession] = None
 
-        # Track if we're waiting to send the final createTrip event
         self._pending_create_trip = False
         self._create_trip_event_sent = False
 
@@ -113,8 +108,9 @@ class RaahiAssistant(Agent):
         self._vad_bridge: Optional[VADEventBridge] = None
         self._energy_calculator = AudioEnergyCalculator()
 
-        # Noise cancellation processor reference
-        self._nc_processor = None
+        # Noise cancellation manager
+        self._nc_manager: Optional[NoiseCancellationManager] = None
+        self._audio_processing_task: Optional[asyncio.Task] = None
 
         formatted_prompt = PROMPT.format(
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M"),
@@ -136,16 +132,43 @@ class RaahiAssistant(Agent):
         """Set the agent session reference."""
         self._session = session
 
-    def set_noise_cancellation_processor(self, processor):
-        """Store reference to noise cancellation processor."""
-        self._nc_processor = processor
-        logger.info("Noise cancellation processor attached to assistant")
+    async def setup_noise_cancellation(self):
+        """Initialize and start noise cancellation manager."""
+        nc_config = NoiseCancellationConfig(
+            enabled=Config.NC_ENABLED,
+            noise_reduction_strength=Config.NC_STRENGTH,
+            silence_timeout_seconds=Config.NC_SILENCE_TIMEOUT,
+            noise_flood_timeout_seconds=Config.NC_NOISE_FLOOD_TIMEOUT,
+            speech_energy_threshold=Config.NC_SPEECH_ENERGY_THRESHOLD,
+            agent_speaking_grace_seconds=Config.NC_AGENT_GRACE_SECONDS,
+        )
 
-    def get_nc_stats(self) -> dict:
-        """Get noise cancellation statistics."""
-        if self._nc_processor:
-            return self._nc_processor.get_stats()
-        return {"status": "not configured"}
+        self._nc_manager = NoiseCancellationManager(
+            config=nc_config,
+            on_timeout=self._on_nc_timeout,
+        )
+
+        await self._nc_manager.start()
+        logger.info("Noise cancellation manager started")
+
+    async def stop_noise_cancellation(self):
+        """Stop noise cancellation manager."""
+        if self._nc_manager:
+            await self._nc_manager.stop()
+            logger.info(f"NC stats: {self._nc_manager.get_stats()}")
+
+        if self._audio_processing_task:
+            self._audio_processing_task.cancel()
+            try:
+                await self._audio_processing_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _on_nc_timeout(self, reason: str):
+        """Called when noise cancellation detects a timeout condition."""
+        logger.warning(f"NC timeout triggered: {reason}")
+        if self._session and not self._is_paused:
+            await self.pause_session(self._session, reason)
 
     async def setup_session_monitor(self):
         """Initialize and start the session monitor with VAD bridge."""
@@ -189,10 +212,6 @@ class RaahiAssistant(Agent):
         if self._session_monitor:
             await self._session_monitor.stop()
 
-        # Log NC stats on shutdown
-        nc_stats = self.get_nc_stats()
-        logger.info(f"Noise cancellation final stats: {nc_stats}")
-
     async def _on_monitor_pause_triggered(self, reason: PauseReason, message: str):
         """Called when session monitor detects a pause condition."""
         logger.info(f"Monitor triggered pause: {reason.value} - {message}")
@@ -232,7 +251,7 @@ class RaahiAssistant(Agent):
         logger.info(f"Sent event to client: {event_name}")
 
     async def pause_session(self, session: AgentSession, reason: str = "user_away"):
-        """Pause the session and notify client. Agent stops all processing."""
+        """Pause the session and notify client."""
         if self._is_paused:
             return
 
@@ -256,6 +275,7 @@ class RaahiAssistant(Agent):
             "noise_flood": away_msg,
             "silence_timeout": away_msg,
             "user_disconnected": away_msg,
+            "noise_flood_timeout": away_msg,
         }
 
         message = pause_messages.get(
@@ -291,11 +311,8 @@ class RaahiAssistant(Agent):
 
         logger.info(f"Session resuming from: {self._pause_reason}")
 
-        previous_reason = self._pause_reason
         self._is_paused = False
         self._pause_reason = None
-
-        logger.info(f"Flags reset, is_paused now: {self._is_paused}")
 
         if self._session_monitor:
             self._session_monitor.resume()
@@ -305,16 +322,13 @@ class RaahiAssistant(Agent):
             "trip_info": self.trip_info.model_dump(),
             "message": "Session resumed",
         })
-        logger.info("Sent RESUMED event to client")
 
         context = self._get_trip_context()
-        logger.info(f"About to say welcome back message: {context[:50]}...")
         try:
             await session.say(
                 text=f"Welcome back! {context}",
                 allow_interruptions=True,
             )
-            logger.info("Welcome back message spoken successfully")
         except Exception as e:
             logger.error(f"Could not say resume message: {e}", exc_info=True)
 
@@ -349,19 +363,18 @@ class RaahiAssistant(Agent):
             )
 
     def on_audio_frame(self, energy: float, is_speech: bool):
-        """
-        Forward audio frame data to session monitor.
-
-        This is called by the noise cancellation processor for each frame,
-        providing both energy level and speech detection.
-        """
+        """Forward audio frame data to session monitor."""
         if self._session_monitor:
             self._session_monitor.on_audio_frame(energy, is_speech)
 
     def on_stt_result(self, transcript: str, is_final: bool):
-        """Forward STT result to session monitor."""
+        """Forward STT result to session monitor and NC manager."""
         if self._session_monitor:
             self._session_monitor.on_stt_result(transcript, is_final)
+
+        # Also notify NC manager of valid STT
+        if self._nc_manager and is_final and transcript:
+            self._nc_manager.on_stt_result(transcript)
 
     def on_agent_speech_start(self):
         """Notify session monitor that agent started speaking."""
@@ -373,28 +386,72 @@ class RaahiAssistant(Agent):
         if self._session_monitor:
             self._session_monitor.on_agent_speech_end()
 
+        # Also notify NC manager
+        if self._nc_manager:
+            self._nc_manager.on_agent_speech()
+
+    async def handle_audio_track(self, track: rtc.Track, participant: rtc.RemoteParticipant):
+        """
+        Subscribe to audio track and process frames through noise cancellation.
+        """
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+
+        logger.info(f"Processing audio track from {participant.identity}")
+
+        audio_stream = rtc.AudioStream(track)
+
+        try:
+            async for frame_event in audio_stream:
+                if self._is_paused:
+                    continue
+
+                frame = frame_event.frame
+
+                # Get raw audio data
+                audio_bytes = frame.data.tobytes() if hasattr(
+                    frame.data, 'tobytes') else bytes(frame.data)
+                audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+
+                # Process through noise cancellation
+                if self._nc_manager:
+                    processed_audio, energy = self._nc_manager.process_audio_frame(
+                        audio_data,
+                        frame.sample_rate
+                    )
+
+                    # Determine if this looks like speech
+                    is_speech = energy > Config.NC_SPEECH_ENERGY_THRESHOLD
+
+                    # Forward to session monitor
+                    self.on_audio_frame(energy, is_speech)
+                else:
+                    # Fallback: just calculate energy
+                    energy = self._energy_calculator.calculate_energy(
+                        audio_bytes, sample_width=2)
+                    is_speech = energy > Config.NOISE_ENERGY_THRESHOLD
+                    self.on_audio_frame(energy, is_speech)
+
+        except Exception as e:
+            logger.error(f"Audio track processing error: {e}")
+        finally:
+            logger.info("Audio track processing ended")
+
     async def send_final_trip_event(self, completion_message: str):
-        """
-        Send the final createTrip event with complete chat history.
-        Called after the completion message has been logged.
-        """
+        """Send the final createTrip event with complete chat history."""
         if self._create_trip_event_sent:
             logger.debug("Final trip event already sent, skipping")
             return
 
-        # Ensure the completion message is in the chat history
         if completion_message and completion_message.strip():
-            # Check if already logged
             if not self._chat_history or self._chat_history[-1].text != completion_message.strip():
                 self.log_agent(completion_message)
 
-        # Set the chat history with all messages
         self.trip_info.chatHistory = self._chat_history.copy()
 
         logger.info(f"""Sending final trip event with {
                     len(self.trip_info.chatHistory)} messages""")
 
-        # Send the final event
         await self.ui.send_trip_update(self.trip_info)
         self._create_trip_event_sent = True
         self._pending_create_trip = False
@@ -443,7 +500,7 @@ class RaahiAssistant(Agent):
             self.trip_info.createTrip = True
             self._pending_create_trip = True
             logger.info(
-                "createTrip=True received, waiting for completion message before sending event")
+                "createTrip=True received, waiting for completion message")
             return "Trip details updated. Completion message will trigger final event."
         else:
             await self.ui.send_trip_update(self.trip_info)
@@ -451,11 +508,7 @@ class RaahiAssistant(Agent):
 
 
 async def play_greeting(session: AgentSession, event_id: str) -> bool:
-    """
-    Play pre-recorded greeting or use TTS fallback.
-
-    Returns True if successful.
-    """
+    """Play pre-recorded greeting or use TTS fallback."""
     response = get_response(event_id)
     audio_path = response.audio_path if response.exists() else None
 
@@ -490,12 +543,6 @@ async def raahi_agent(ctx: agents.JobContext):
     """Main agent entrypoint."""
     await ctx.connect()
     logger.info(f"Agent connected to room: {ctx.room.name}")
-
-    # Diagnose noise cancellation setup
-    nc_status = diagnose_setup()
-    logger.info(f"Noise cancellation status: {nc_status}")
-    for note in nc_status.get("notes", []):
-        logger.info(f"  - {note}")
 
     participant = next(iter(ctx.room.remote_participants.values()), None)
     user_profile = UserProfile()
@@ -542,28 +589,6 @@ async def raahi_agent(ctx: agents.JobContext):
         session_data=session_data,
     )
 
-    # Create noise cancellation configuration
-    nc_config = NoiseConfig(
-        enabled=Config.NC_ENABLED,
-        noise_reduction_strength=Config.NC_STRENGTH,
-        stationary_noise=Config.NC_STATIONARY,
-        highpass_cutoff_hz=Config.NC_HIGHPASS_HZ,
-        time_constant_s=Config.NC_TIME_CONSTANT,
-    )
-
-    # Create noise cancellation processor with callback to session monitor
-    nc_processor = create_noise_cancellation_processor(
-        config=nc_config,
-        on_audio_metrics=assistant.on_audio_frame,
-    )
-
-    if nc_processor:
-        assistant.set_noise_cancellation_processor(nc_processor)
-        logger.info("✓ Noise cancellation processor created and attached")
-    else:
-        logger.warning(
-            "✗ Noise cancellation not available - STT may be affected by background noise")
-
     session = AgentSession(
         stt=google.STT(model=Config.STT_MODEL, languages=Config.STT_LANGUAGE),
         llm=google.LLM(
@@ -592,11 +617,10 @@ async def raahi_agent(ctx: agents.JobContext):
     )
 
     assistant.set_session(session)
-    await assistant.setup_session_monitor()
 
-    async def should_process_input() -> bool:
-        """Check if we should process user input."""
-        return not assistant.is_paused
+    # Start noise cancellation BEFORE session monitor
+    await assistant.setup_noise_cancellation()
+    await assistant.setup_session_monitor()
 
     @session.on("user_state_changed")
     def on_user_state_changed(event: UserStateChangedEvent):
@@ -637,8 +661,7 @@ async def raahi_agent(ctx: agents.JobContext):
                 ]
                 if any(phrase in text.lower() for phrase in completion_phrases):
                     logger.info(
-                        f"Completion message detected, sending final trip event")
-                    # Send the final event with complete chat history
+                        "Completion message detected, sending final trip event")
                     asyncio.create_task(assistant.send_final_trip_event(text))
 
     @session.on("agent_speech_started")
@@ -653,9 +676,7 @@ async def raahi_agent(ctx: agents.JobContext):
 
     @session.on("user_started_speaking")
     def on_user_started_speaking():
-        """VAD detected user started speaking."""
         if assistant.is_paused:
-            logger.debug("Ignoring VAD start - session is paused")
             return
         logger.debug("VAD: User started speaking")
         if assistant._vad_bridge:
@@ -663,9 +684,7 @@ async def raahi_agent(ctx: agents.JobContext):
 
     @session.on("user_stopped_speaking")
     def on_user_stopped_speaking():
-        """VAD detected user stopped speaking."""
         if assistant.is_paused:
-            logger.debug("Ignoring VAD stop - session is paused")
             return
         logger.debug("VAD: User stopped speaking")
         if assistant._vad_bridge:
@@ -690,15 +709,11 @@ async def raahi_agent(ctx: agents.JobContext):
                 logger.info(f"""Client requested resume, is_paused: {
                             assistant.is_paused}""")
                 if assistant.is_paused:
-                    logger.info("Triggering resume_session...")
                     asyncio.create_task(assistant.resume_session(session))
-                else:
-                    logger.info("Session not paused, ignoring resume request")
                 return
 
             if event_name == "user_selection":
                 if assistant.is_paused:
-                    logger.debug("Ignoring user_selection - session is paused")
                     return
                 selection = IncomingUserSelection(**payload)
                 asyncio.create_task(
@@ -719,14 +734,23 @@ async def raahi_agent(ctx: agents.JobContext):
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info(f"Participant connected: {participant.identity}")
 
-    # Start session with noise cancellation integrated
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant
+    ):
+        """Handle track subscription - process audio through noise cancellation."""
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info(f"Audio track subscribed from {participant.identity}")
+            asyncio.create_task(
+                assistant.handle_audio_track(track, participant))
+
     await session.start(
         room=ctx.room,
         agent=assistant,
         room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=nc_processor,  # KEY: Integrate NC into audio pipeline
-            ),
+            audio_input=room_io.AudioInputOptions(),
             close_on_disconnect=Config.CLOSE_ON_DISCONNECT,
             delete_room_on_close=Config.DELETE_ROOM_ON_CLOSE,
         ),
@@ -738,12 +762,13 @@ async def raahi_agent(ctx: agents.JobContext):
             allow_interruptions=False
         )
 
-    logger.info("Agent session running...")
+    logger.info("Agent session running with noise cancellation enabled...")
 
     try:
         while True:
             await asyncio.sleep(1)
     except asyncio.CancelledError:
+        await assistant.stop_noise_cancellation()
         await assistant.stop_session_monitor()
         raise
 
