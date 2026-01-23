@@ -23,6 +23,12 @@ from audio_player import stream_wav_file
 from session_monitor import SessionMonitor, SessionMonitorConfig, PauseReason
 from audio_processor import VADEventBridge, AudioEnergyCalculator
 
+from noise_cancellation import (
+    create_noise_cancellation_processor,
+    NoiseConfig,
+    diagnose_setup,
+)
+
 
 class SessionEvent:
     """Events sent between agent and client."""
@@ -66,13 +72,20 @@ class Config:
     NOISE_ENERGY_THRESHOLD = 0.02
     POST_STT_GRACE_SECONDS = 15.0
 
+    # Noise cancellation settings
+    NC_ENABLED = True
+    NC_STRENGTH = 0.6  # 0.0-1.0, higher = more aggressive reduction
+    NC_STATIONARY = False  # False = better for varying real-world noise
+    NC_HIGHPASS_HZ = 80  # Remove low-frequency rumble (traffic, AC, etc.)
+    NC_TIME_CONSTANT = 0.4  # Adaptation speed (lower = faster)
+
 
 class RaahiAssistant(Agent):
     """
     Raahi voice assistant for cab booking.
 
     Clean implementation using LiveKit's Agent class with
-    intelligent session monitoring.
+    intelligent session monitoring and noise cancellation.
     """
 
     def __init__(
@@ -97,9 +110,11 @@ class RaahiAssistant(Agent):
         self._create_trip_event_sent = False
 
         self._session_monitor: Optional[SessionMonitor] = None
-
         self._vad_bridge: Optional[VADEventBridge] = None
         self._energy_calculator = AudioEnergyCalculator()
+
+        # Noise cancellation processor reference
+        self._nc_processor = None
 
         formatted_prompt = PROMPT.format(
             current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M"),
@@ -120,6 +135,17 @@ class RaahiAssistant(Agent):
     def set_session(self, session: AgentSession):
         """Set the agent session reference."""
         self._session = session
+
+    def set_noise_cancellation_processor(self, processor):
+        """Store reference to noise cancellation processor."""
+        self._nc_processor = processor
+        logger.info("Noise cancellation processor attached to assistant")
+
+    def get_nc_stats(self) -> dict:
+        """Get noise cancellation statistics."""
+        if self._nc_processor:
+            return self._nc_processor.get_stats()
+        return {"status": "not configured"}
 
     async def setup_session_monitor(self):
         """Initialize and start the session monitor with VAD bridge."""
@@ -162,6 +188,10 @@ class RaahiAssistant(Agent):
         """Stop the session monitor."""
         if self._session_monitor:
             await self._session_monitor.stop()
+
+        # Log NC stats on shutdown
+        nc_stats = self.get_nc_stats()
+        logger.info(f"Noise cancellation final stats: {nc_stats}")
 
     async def _on_monitor_pause_triggered(self, reason: PauseReason, message: str):
         """Called when session monitor detects a pause condition."""
@@ -319,7 +349,12 @@ class RaahiAssistant(Agent):
             )
 
     def on_audio_frame(self, energy: float, is_speech: bool):
-        """Forward audio frame data to session monitor."""
+        """
+        Forward audio frame data to session monitor.
+
+        This is called by the noise cancellation processor for each frame,
+        providing both energy level and speech detection.
+        """
         if self._session_monitor:
             self._session_monitor.on_audio_frame(energy, is_speech)
 
@@ -337,39 +372,6 @@ class RaahiAssistant(Agent):
         """Notify session monitor that agent finished speaking."""
         if self._session_monitor:
             self._session_monitor.on_agent_speech_end()
-
-    async def handle_audio_track(self, track: rtc.Track, participant: rtc.RemoteParticipant):
-        """
-        Subscribe to audio track and process frames for energy monitoring.
-
-        This allows us to detect noisy environments even when VAD doesn't trigger.
-        """
-        if track.kind != rtc.TrackKind.KIND_AUDIO:
-            return
-
-        logger.info(f"Subscribing to audio track from {participant.identity}")
-
-        audio_stream = rtc.AudioStream(track)
-
-        try:
-            async for frame_event in audio_stream:
-                if self._is_paused:
-                    continue
-
-                energy = self._energy_calculator.calculate_energy(
-                    frame_event.frame.data.tobytes()
-                    if hasattr(frame_event.frame.data, 'tobytes')
-                    else bytes(frame_event.frame.data),
-                    sample_width=2
-                )
-
-                is_speech_like = energy > Config.NOISE_ENERGY_THRESHOLD
-                self.on_audio_frame(energy, is_speech_like)
-
-        except Exception as e:
-            logger.error(f"Audio track processing error: {e}")
-        finally:
-            logger.info("Audio track processing ended")
 
     async def send_final_trip_event(self, completion_message: str):
         """
@@ -489,6 +491,12 @@ async def raahi_agent(ctx: agents.JobContext):
     await ctx.connect()
     logger.info(f"Agent connected to room: {ctx.room.name}")
 
+    # Diagnose noise cancellation setup
+    nc_status = diagnose_setup()
+    logger.info(f"Noise cancellation status: {nc_status}")
+    for note in nc_status.get("notes", []):
+        logger.info(f"  - {note}")
+
     participant = next(iter(ctx.room.remote_participants.values()), None)
     user_profile = UserProfile()
 
@@ -533,6 +541,28 @@ async def raahi_agent(ctx: agents.JobContext):
         user_profile=user_profile,
         session_data=session_data,
     )
+
+    # Create noise cancellation configuration
+    nc_config = NoiseConfig(
+        enabled=Config.NC_ENABLED,
+        noise_reduction_strength=Config.NC_STRENGTH,
+        stationary_noise=Config.NC_STATIONARY,
+        highpass_cutoff_hz=Config.NC_HIGHPASS_HZ,
+        time_constant_s=Config.NC_TIME_CONSTANT,
+    )
+
+    # Create noise cancellation processor with callback to session monitor
+    nc_processor = create_noise_cancellation_processor(
+        config=nc_config,
+        on_audio_metrics=assistant.on_audio_frame,
+    )
+
+    if nc_processor:
+        assistant.set_noise_cancellation_processor(nc_processor)
+        logger.info("✓ Noise cancellation processor created and attached")
+    else:
+        logger.warning(
+            "✗ Noise cancellation not available - STT may be affected by background noise")
 
     session = AgentSession(
         stt=google.STT(model=Config.STT_MODEL, languages=Config.STT_LANGUAGE),
@@ -689,23 +719,14 @@ async def raahi_agent(ctx: agents.JobContext):
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info(f"Participant connected: {participant.identity}")
 
-    @ctx.room.on("track_subscribed")
-    def on_track_subscribed(
-        track: rtc.Track,
-        publication: rtc.RemoteTrackPublication,
-        participant: rtc.RemoteParticipant
-    ):
-        """Handle track subscription to process audio for energy monitoring."""
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            logger.info(f"Audio track subscribed from {participant.identity}")
-            asyncio.create_task(
-                assistant.handle_audio_track(track, participant))
-
+    # Start session with noise cancellation integrated
     await session.start(
         room=ctx.room,
         agent=assistant,
         room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(),
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=nc_processor,  # KEY: Integrate NC into audio pipeline
+            ),
             close_on_disconnect=Config.CLOSE_ON_DISCONNECT,
             delete_room_on_close=Config.DELETE_ROOM_ON_CLOSE,
         ),
