@@ -23,7 +23,7 @@ from audio_responses import get_response, DEFAULT_EVENT_ID
 from audio_player import stream_wav_file
 from session_monitor import SessionMonitor, SessionMonitorConfig, PauseReason
 from audio_processor import VADEventBridge, AudioEnergyCalculator
-
+from zoneinfo import ZoneInfo
 # Import noise cancellation
 from noise_cancellation import (
     NoiseCancellationManager,
@@ -113,7 +113,8 @@ class RaahiAssistant(Agent):
         self._audio_processing_task: Optional[asyncio.Task] = None
 
         formatted_prompt = PROMPT.format(
-            current_date=datetime.now().strftime("%A, %Y-%m-%d %H:%M"),
+            current_date=datetime.now(
+                ZoneInfo("Asia/Kolkata")).strftime("%A, %Y-%m-%d %H:%M"),
             user_name=self.user_profile.name,
             user_phone=self.user_profile.phone_number,
             user_context_json=json.dumps({
