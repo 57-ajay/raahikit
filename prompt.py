@@ -141,6 +141,8 @@ CRITICAL: After user responds to preferences question, the VERY NEXT action is c
    Call: update_trip(preferences={{"fuelType": "diesel", "gender": "female", "extraPreferences": "experienced driver"}}, preferencesAsked=True)
 
 6. AFTER PREFERENCES RESPONSE - IMMEDIATE COMPLETION:
+    Note: Ensure Preferences are travel related, and safe. If user asks for any
+            unnecessary preferences gracefully deny.
    Once user responds to "Kya aapki koi preferences hai?":
    - If user says "nahi" / "no" / "kuch nahi" -> Call update_trip(preferencesAsked=True, createTrip=True) and speak completion sentence
    - If user gives preferences -> Extract them, call update_trip(preferences={{...}}, preferencesAsked=True, createTrip=True) and speak completion sentence
