@@ -7,6 +7,9 @@ Detects scenarios where the agent should pause:
 3. Silence timeout: No audio activity for extended period
 
 The agent pauses gracefully and resumes when client sends resume event.
+
+IMPORTANT: The monitor should NOT pause when user is actively engaged in
+trip-related conversation (receiving valid STT results).
 """
 
 import logging
@@ -37,18 +40,22 @@ class SessionMonitorConfig:
     silence_timeout_seconds: float = 30.0
 
     noise_without_stt_timeout_seconds: float = 15.0
-    noise_energy_threshold: float = 0.02  # RMS energy threshold for "noise"
+    noise_energy_threshold: float = 0.02
 
     continuous_speech_timeout_seconds: float = 30.0
     utterance_gap_seconds: float = 2.0
 
-    min_valid_utterance_length: int = 3
-    max_fragmented_utterances: int = 5
+    min_valid_utterance_length: int = 2
+    max_fragmented_utterances: int = 8
 
     agent_speaking_grace_seconds: float = 5.0
     post_agent_grace_seconds: float = 3.0
 
+    post_stt_grace_seconds: float = 10.0
+
     energy_window_size: int = 50
+
+    min_pause_interval_seconds: float = 60.0
 
 
 @dataclass
@@ -75,6 +82,9 @@ class SpeechMetrics:
     total_speech_frames: int = 0
     total_frames: int = 0
 
+    valid_stt_count: int = 0
+    last_pause_time: float = 0.0
+
     def get_average_energy(self) -> float:
         if not self.energy_history:
             return 0.0
@@ -94,6 +104,8 @@ class SessionMonitor:
     1. Silence: No audio energy for extended period
     2. Noisy environment: High energy but no valid STT
     3. User talking to others: Continuous speech without conversation patterns
+
+    IMPORTANT: Does NOT pause when user is actively engaged (recent valid STT).
     """
 
     def __init__(
@@ -114,7 +126,9 @@ class SessionMonitor:
                     f"silence={self.config.silence_timeout_seconds}s, "
                     f"""noise_no_stt={
                         self.config.noise_without_stt_timeout_seconds}s, """
-                    f"continuous_speech={self.config.continuous_speech_timeout_seconds}s")
+                    f"""continuous_speech={
+                        self.config.continuous_speech_timeout_seconds}s, """
+                    f"post_stt_grace={self.config.post_stt_grace_seconds}s")
 
     async def start(self):
         """Start the session monitor."""
@@ -137,11 +151,13 @@ class SessionMonitor:
         logger.info(f"Session monitor stopped. Stats: "
                     f"frames={self.metrics.total_frames}, "
                     f"speech_ratio={self.metrics.get_speech_ratio():.1%}, "
-                    f"avg_energy={self.metrics.get_average_energy():.4f}")
+                    f"avg_energy={self.metrics.get_average_energy():.4f}, "
+                    f"valid_stt_count={self.metrics.valid_stt_count}")
 
     def pause(self):
         """Externally pause the monitor (prevents triggering while already paused)."""
         self._paused = True
+        self.metrics.last_pause_time = time.time()
         logger.debug("Monitor paused externally")
 
     def resume(self):
@@ -212,6 +228,7 @@ class SessionMonitor:
         now = time.time()
         self.metrics.last_valid_stt_time = now
         self.metrics.recent_utterances.append(transcript)
+        self.metrics.valid_stt_count += 1
 
         self.metrics.high_energy_start = None
 
@@ -241,7 +258,7 @@ class SessionMonitor:
         """Main monitoring loop - checks for pause conditions."""
         while self._running:
             try:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.0)
 
                 if self._paused:
                     continue
@@ -252,6 +269,7 @@ class SessionMonitor:
                     logger.warning(f"""Pause triggered: {
                                    reason.value} - {message}""")
                     self._paused = True  # Prevent re-triggering
+                    self.metrics.last_pause_time = time.time()
 
                     if self.on_pause_triggered:
                         await self.on_pause_triggered(reason, message)
@@ -272,6 +290,16 @@ class SessionMonitor:
 
         time_since_agent = now - self.metrics.last_agent_speech_end
         if time_since_agent < self.config.agent_speaking_grace_seconds:
+            return None
+
+        time_since_valid_stt = now - self.metrics.last_valid_stt_time
+        if time_since_valid_stt < self.config.post_stt_grace_seconds:
+            logger.debug(f"""Within STT grace period ({time_since_valid_stt:.1f}s < {
+                         self.config.post_stt_grace_seconds}s)""")
+            return None
+
+        time_since_last_pause = now - self.metrics.last_pause_time
+        if self.metrics.last_pause_time > 0 and time_since_last_pause < self.config.min_pause_interval_seconds:
             return None
 
         silence_duration = now - self.metrics.last_any_audio_time
@@ -297,17 +325,20 @@ class SessionMonitor:
 
         if self.metrics.continuous_speech_start is not None:
             continuous_duration = now - self.metrics.continuous_speech_start
+            stt_silence = now - self.metrics.last_valid_stt_time
 
-            if continuous_duration >= self.config.continuous_speech_timeout_seconds:
+            if (continuous_duration >= self.config.continuous_speech_timeout_seconds and
+                    stt_silence >= self.config.continuous_speech_timeout_seconds):
                 return (
                     PauseReason.USER_TALKING_TO_OTHERS,
-                    f"Continuous speech for {continuous_duration:.1f}s - "
+                    f"""Continuous speech for {
+                        continuous_duration:.1f}s without valid transcription - """
                     f"user may be talking to someone else"
                 )
 
         if self.metrics.fragmented_utterance_count >= self.config.max_fragmented_utterances:
             stt_gap = now - self.metrics.last_valid_stt_time
-            if stt_gap > self.config.post_agent_grace_seconds:
+            if stt_gap > self.config.post_stt_grace_seconds:
                 return (
                     PauseReason.USER_TALKING_TO_OTHERS,
                     f"""Detected {
@@ -331,5 +362,6 @@ class SessionMonitor:
                 if self.metrics.continuous_speech_start else 0.0
             ),
             "fragmented_utterances": self.metrics.fragmented_utterance_count,
+            "valid_stt_count": self.metrics.valid_stt_count,
             "is_paused": self._paused,
         }

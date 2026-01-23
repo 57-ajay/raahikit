@@ -59,10 +59,12 @@ class Config:
     VAD_MIN_SILENCE_DURATION = 0.6
     VAD_ACTIVATION_THRESHOLD = 0.5
 
+    # Session monitor settings
     SILENCE_TIMEOUT = 30.0
-    NOISE_WITHOUT_STT_TIMEOUT = 15.0
+    NOISE_WITHOUT_STT_TIMEOUT = 20.0
     CONTINUOUS_SPEECH_TIMEOUT = 30.0
     NOISE_ENERGY_THRESHOLD = 0.02
+    POST_STT_GRACE_SECONDS = 15.0
 
 
 class RaahiAssistant(Agent):
@@ -89,6 +91,10 @@ class RaahiAssistant(Agent):
         self._pause_reason: Optional[str] = None
         self._chat_history: list[ChatMessage] = []
         self._session: Optional[AgentSession] = None
+
+        # Track if we're waiting to send the final createTrip event
+        self._pending_create_trip = False
+        self._create_trip_event_sent = False
 
         self._session_monitor: Optional[SessionMonitor] = None
 
@@ -124,8 +130,10 @@ class RaahiAssistant(Agent):
             noise_energy_threshold=Config.NOISE_ENERGY_THRESHOLD,
             agent_speaking_grace_seconds=5.0,
             post_agent_grace_seconds=3.0,
-            min_valid_utterance_length=3,
-            max_fragmented_utterances=5,
+            post_stt_grace_seconds=Config.POST_STT_GRACE_SECONDS,
+            min_valid_utterance_length=2,
+            max_fragmented_utterances=8,
+            min_pause_interval_seconds=60.0,
         )
 
         self._session_monitor = SessionMonitor(
@@ -165,16 +173,18 @@ class RaahiAssistant(Agent):
     def log_user(self, text: str):
         """Log user message to chat history."""
         if text and text.strip():
-            self._chat_history.append(
-                ChatMessage(role="user", text=text.strip()))
-            logger.debug(f"Logged user: {text[:50]}...")
+            msg = ChatMessage(role="user", text=text.strip())
+            self._chat_history.append(msg)
+            logger.debug(f"""Logged user: {text[:50]}... (total: {
+                         len(self._chat_history)})""")
 
     def log_agent(self, text: str):
         """Log agent message to chat history."""
         if text and text.strip():
-            self._chat_history.append(ChatMessage(
-                role="agent", text=text.strip()))
-            logger.debug(f"Logged agent: {text[:50]}...")
+            msg = ChatMessage(role="agent", text=text.strip())
+            self._chat_history.append(msg)
+            logger.debug(f"""Logged agent: {
+                         text[:50]}... (total: {len(self._chat_history)})""")
 
     async def send_event(self, event_name: str, data: Optional[dict] = None):
         """Send event to client."""
@@ -207,7 +217,7 @@ class RaahiAssistant(Agent):
         except Exception as e:
             logger.debug(f"No activity to interrupt: {e}")
 
-        away_msg = "Maaf kijiyega me kuch samajh nhi paayi",
+        away_msg = "Maaf kijiyega me kuch samajh nahi paayi"
 
         pause_messages = {
             "user_away": away_msg,
@@ -361,6 +371,32 @@ class RaahiAssistant(Agent):
         finally:
             logger.info("Audio track processing ended")
 
+    async def send_final_trip_event(self, completion_message: str):
+        """
+        Send the final createTrip event with complete chat history.
+        Called after the completion message has been logged.
+        """
+        if self._create_trip_event_sent:
+            logger.debug("Final trip event already sent, skipping")
+            return
+
+        # Ensure the completion message is in the chat history
+        if completion_message and completion_message.strip():
+            # Check if already logged
+            if not self._chat_history or self._chat_history[-1].text != completion_message.strip():
+                self.log_agent(completion_message)
+
+        # Set the chat history with all messages
+        self.trip_info.chatHistory = self._chat_history.copy()
+
+        logger.info(f"""Sending final trip event with {
+                    len(self.trip_info.chatHistory)} messages""")
+
+        # Send the final event
+        await self.ui.send_trip_update(self.trip_info)
+        self._create_trip_event_sent = True
+        self._pending_create_trip = False
+
     @function_tool
     async def update_trip(
         self,
@@ -390,10 +426,6 @@ class RaahiAssistant(Agent):
                     preferences["vehicle_type"]]
         if preferencesAsked is not None:
             self.trip_info.preferencesAsked = preferencesAsked
-        if createTrip is not None:
-            self.trip_info.createTrip = createTrip
-            if createTrip:
-                self.trip_info.chatHistory = self._chat_history.copy()
 
         if tripType == "one-way" and startDate and not endDate:
             try:
@@ -405,8 +437,15 @@ class RaahiAssistant(Agent):
         elif endDate:
             self.trip_info.endDate = endDate
 
-        await self.ui.send_trip_update(self.trip_info)
-        return "Trip details updated."
+        if createTrip:
+            self.trip_info.createTrip = True
+            self._pending_create_trip = True
+            logger.info(
+                "createTrip=True received, waiting for completion message before sending event")
+            return "Trip details updated. Completion message will trigger final event."
+        else:
+            await self.ui.send_trip_update(self.trip_info)
+            return "Trip details updated."
 
 
 async def play_greeting(session: AgentSession, event_id: str) -> bool:
@@ -559,6 +598,18 @@ async def raahi_agent(ctx: agents.JobContext):
 
         if role == "agent" and text:
             assistant.log_agent(text)
+
+            if assistant._pending_create_trip and not assistant._create_trip_event_sent:
+                completion_phrases = [
+                    "trip create kardi",
+                    "drivers ki quotations",
+                    "unse connect kar sakte"
+                ]
+                if any(phrase in text.lower() for phrase in completion_phrases):
+                    logger.info(
+                        f"Completion message detected, sending final trip event")
+                    # Send the final event with complete chat history
+                    asyncio.create_task(assistant.send_final_trip_event(text))
 
     @session.on("agent_speech_started")
     def on_agent_speech_started():
