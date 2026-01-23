@@ -65,7 +65,7 @@ class Config:
 
     # Session monitor settings
     SILENCE_TIMEOUT = 30.0
-    NOISE_WITHOUT_STT_TIMEOUT = 20.0
+    NOISE_WITHOUT_STT_TIMEOUT = 30.0
     CONTINUOUS_SPEECH_TIMEOUT = 30.0
     NOISE_ENERGY_THRESHOLD = 0.02
     POST_STT_GRACE_SECONDS = 15.0
@@ -73,10 +73,10 @@ class Config:
     # Noise cancellation settings
     NC_ENABLED = True
     NC_STRENGTH = 0.7
-    NC_SILENCE_TIMEOUT = 15.0
-    NC_NOISE_FLOOD_TIMEOUT = 15.0
+    NC_SILENCE_TIMEOUT = 30.0
+    NC_NOISE_FLOOD_TIMEOUT = 30.0
     NC_SPEECH_ENERGY_THRESHOLD = 0.01
-    NC_AGENT_GRACE_SECONDS = 5.0
+    NC_AGENT_GRACE_SECONDS = 15.0
 
 
 class RaahiAssistant(Agent):
