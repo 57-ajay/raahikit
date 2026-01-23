@@ -72,8 +72,8 @@ The agent MUST follow this order exactly:
 3. tripDates -> if tripType == 'one-way' ask Start Date
    else if tripType == 'round-trip' ask Start Date and End Date
    EXAMPLE:
-       'one-way': 'Kya aap mujhe Start Date bta sakte hai?'
-       'round-trip': 'Kya aap mujhe Start aur End Date bta sakte hai?'
+       'one-way': 'Kya aap mujhe Start Date bata sakte hai?'
+       'round-trip': 'Kya aap mujhe Start aur End Date bata sakte hai?'
 4. preferences -> Ask ONLY if preferencesAsked == False AND user has not mentioned any preferences during conversation
    Ask: "Kya aapki koi preferences hai?"
    - If user says "nahi" / "no" / "koi nahi" -> set preferencesAsked=True, createTrip=True and speak completion

@@ -207,13 +207,15 @@ class RaahiAssistant(Agent):
         except Exception as e:
             logger.debug(f"No activity to interrupt: {e}")
 
+        away_msg = "Maaf kijiyega me kuch samajh nhi paayi",
+
         pause_messages = {
-            "user_away": "Aap wapas aayein tab baat karte hain.",
-            "noisy_environment": "Bahut shor hai, shant jagah mein baat karein.",
-            "user_talking_to_others": "Lagta hai aap kisi aur se baat kar rahe hain. Jab free hon tab bolein.",
-            "noise_flood": "Awaz theek se nahi aa rahi. Please check your microphone.",
-            "silence_timeout": "Koi response nahi mila. Jab ready hon tab bolein.",
-            "user_disconnected": "Connection lost. Reconnect hone par baat karenge.",
+            "user_away": away_msg,
+            "noisy_environment": away_msg,
+            "user_talking_to_others": away_msg,
+            "noise_flood": away_msg,
+            "silence_timeout": away_msg,
+            "user_disconnected": away_msg,
         }
 
         message = pause_messages.get(
@@ -291,7 +293,7 @@ class RaahiAssistant(Agent):
                 return "Aapki trip details ready hain."
         elif self.trip_info.pickup:
             return f"Aapne pickup {self.trip_info.pickup} bataya tha. Drop kahan hai?"
-        return "Hum kahan the? Aap apna pickup aur drop city bataiye."
+        return "Kya Aap apna pickup aur drop city bata sakte hai."
 
     async def handle_ui_selection(self, session: AgentSession, selection: IncomingUserSelection):
         """Process UI selection from client."""
