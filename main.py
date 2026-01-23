@@ -345,7 +345,7 @@ class RaahiAssistant(Agent):
                     return f"Aapka {self.trip_info.tripType} ready hai, Kya aap apni start aur end Date bata sakte hai?"
                 return f"Aapka {self.trip_info.tripType} trip ready hai, Aapko Kab jana hai?"
             else:
-                return "Aapki trip details ready hain."
+                return "Kya aapki koi specific preferences hai?"
         elif self.trip_info.pickup:
             return f"Aapne pickup {self.trip_info.pickup} bataya tha. Drop kahan hai?"
         return "Kya Aap apna pickup aur drop city bata sakte hai."
