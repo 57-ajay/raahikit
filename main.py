@@ -24,7 +24,8 @@ from audio_player import stream_wav_file
 from session_monitor import SessionMonitor, SessionMonitorConfig, PauseReason
 from audio_processor import VADEventBridge, AudioEnergyCalculator
 from zoneinfo import ZoneInfo
-# Import noise cancellation
+
+# Import the IMPROVED noise cancellation module
 from noise_cancellation import (
     NoiseCancellationManager,
     NoiseCancellationConfig,
@@ -43,45 +44,75 @@ logger = logging.getLogger("raahi-agent")
 
 
 class Config:
-    """Centralized configuration."""
+    """
+    Centralized configuration.
+
+    NOISE HANDLING STRATEGY:
+    Since we can't inject processed audio into LiveKit's STT pipeline,
+    we rely on:
+    1. Google STT's built-in noise handling (telephony model is robust)
+    2. Client-side WebRTC noise suppression (MUST enable on client)
+    3. Intelligent session management to pause when too noisy
+    """
+
     USER_AWAY_TIMEOUT = 30.0
 
     CLOSE_ON_DISCONNECT = False
     DELETE_ROOM_ON_CLOSE = False
 
+    # === STT Settings ===
+    # "telephony" model is optimized for noisy/phone-quality audio
     STT_MODEL = "telephony"
     STT_LANGUAGE = "hi-IN"
 
+    # === TTS Settings ===
     TTS_VOICE = "hi-IN-Chirp3-HD-Aoede"
     TTS_LANGUAGE = "hi-IN"
 
+    # === LLM Settings ===
     LLM_MODEL = "gemini-2.5-flash"
     LLM_LOCATION = "asia-south1"
     LLM_PROJECT = "cabswale-ai"
 
-    VAD_MIN_SPEECH_DURATION = 0.25
-    VAD_MIN_SILENCE_DURATION = 0.6
-    VAD_ACTIVATION_THRESHOLD = 0.5
+    # === VAD Settings ===
+    # Tuned for noisy environments - slightly more tolerant
+    # Increased from 0.25 - needs longer speech to trigger
+    VAD_MIN_SPEECH_DURATION = 0.3
+    # Increased from 0.6 - more silence to end utterance
+    VAD_MIN_SILENCE_DURATION = 0.7
+    VAD_ACTIVATION_THRESHOLD = 0.5     # Keep at 0.5 for balanced sensitivity
 
-    # Session monitor settings
-    SILENCE_TIMEOUT = 30.0
+    # === Session Monitor Settings ===
+    # More tolerant to avoid false pauses
+    SILENCE_TIMEOUT = 45.0             # Increased from 30 - wait longer before pause
+    # Increased from 30 - more tolerance for noisy STT
     NOISE_WITHOUT_STT_TIMEOUT = 30.0
-    CONTINUOUS_SPEECH_TIMEOUT = 30.0
-    NOISE_ENERGY_THRESHOLD = 0.02
-    POST_STT_GRACE_SECONDS = 15.0
+    CONTINUOUS_SPEECH_TIMEOUT = 45.0   # Increased from 30 - allow longer speeches
+    # Increased from 0.02 - less sensitive to low noise
+    NOISE_ENERGY_THRESHOLD = 0.025
+    POST_STT_GRACE_SECONDS = 15.0      # Don't pause if STT was recently successful
 
-    # Noise cancellation settings
+    # === Noise Cancellation Settings ===
     NC_ENABLED = True
-    NC_STRENGTH = 0.7
-    NC_SILENCE_TIMEOUT = 30.0
-    NC_NOISE_FLOOD_TIMEOUT = 30.0
-    NC_SPEECH_ENERGY_THRESHOLD = 0.01
-    NC_AGENT_GRACE_SECONDS = 15.0
+    # Reduced from 0.7 - less aggressive to preserve speech
+    NC_STRENGTH = 0.5
+    NC_SILENCE_TIMEOUT = 45.0          # Match session monitor
+    NC_NOISE_FLOOD_TIMEOUT = 30.0      # Time with noise but no STT before pause
+    NC_SPEECH_ENERGY_THRESHOLD = 0.02  # Energy level indicating potential speech
+    # Increased from 15 - don't pause right after agent speaks
+    NC_AGENT_GRACE_SECONDS = 8.0
+    NC_POST_STT_GRACE_SECONDS = 15.0   # NEW: Don't pause if STT is working
+    NC_MIN_SNR_FOR_SPEECH = 2.5        # NEW: Minimum SNR to consider as speech
 
 
 class RaahiAssistant(Agent):
     """
     Raahi voice assistant for cab booking.
+
+    NOISE HANDLING:
+    - Uses NC manager for audio analysis and timeout detection
+    - Relies on Google STT's built-in noise robustness
+    - Client should enable WebRTC noise suppression for best results
     """
 
     def __init__(
@@ -108,9 +139,13 @@ class RaahiAssistant(Agent):
         self._vad_bridge: Optional[VADEventBridge] = None
         self._energy_calculator = AudioEnergyCalculator()
 
-        # Noise cancellation manager
+        # Noise cancellation manager - handles audio analysis and timeout detection
         self._nc_manager: Optional[NoiseCancellationManager] = None
         self._audio_processing_task: Optional[asyncio.Task] = None
+
+        # Track audio processing state
+        self._audio_frame_count = 0
+        self._last_stats_log = 0
 
         formatted_prompt = PROMPT.format(
             current_date=datetime.now(
@@ -134,7 +169,15 @@ class RaahiAssistant(Agent):
         self._session = session
 
     async def setup_noise_cancellation(self):
-        """Initialize and start noise cancellation manager."""
+        """
+        Initialize and start noise cancellation manager.
+
+        The NC manager:
+        1. Analyzes audio energy and estimates noise floor
+        2. Uses SNR to distinguish speech from noise
+        3. Monitors for timeout conditions (silence, noise flood)
+        4. Does NOT actually filter audio sent to STT (architecture limitation)
+        """
         nc_config = NoiseCancellationConfig(
             enabled=Config.NC_ENABLED,
             noise_reduction_strength=Config.NC_STRENGTH,
@@ -142,6 +185,12 @@ class RaahiAssistant(Agent):
             noise_flood_timeout_seconds=Config.NC_NOISE_FLOOD_TIMEOUT,
             speech_energy_threshold=Config.NC_SPEECH_ENERGY_THRESHOLD,
             agent_speaking_grace_seconds=Config.NC_AGENT_GRACE_SECONDS,
+            post_stt_grace_seconds=Config.NC_POST_STT_GRACE_SECONDS,
+            min_snr_for_speech=Config.NC_MIN_SNR_FOR_SPEECH,
+            # Additional tuning
+            # Better for varying noise (traffic, crowd)
+            stationary_noise=False,
+            time_constant_s=0.4,     # Fast adaptation to changing noise
         )
 
         self._nc_manager = NoiseCancellationManager(
@@ -150,13 +199,15 @@ class RaahiAssistant(Agent):
         )
 
         await self._nc_manager.start()
-        logger.info("Noise cancellation manager started")
+        logger.info(
+            "Noise cancellation manager started with SNR-based detection")
 
     async def stop_noise_cancellation(self):
-        """Stop noise cancellation manager."""
+        """Stop noise cancellation manager and log final stats."""
         if self._nc_manager:
             await self._nc_manager.stop()
-            logger.info(f"NC stats: {self._nc_manager.get_stats()}")
+            stats = self._nc_manager.get_stats()
+            logger.info(f"NC final stats: {stats}")
 
         if self._audio_processing_task:
             self._audio_processing_task.cancel()
@@ -166,23 +217,35 @@ class RaahiAssistant(Agent):
                 pass
 
     async def _on_nc_timeout(self, reason: str):
-        """Called when noise cancellation detects a timeout condition."""
+        """
+        Called when noise cancellation detects a timeout condition.
+
+        This triggers when:
+        - silence_timeout: No audio energy for extended period
+        - noise_flood_timeout: High energy but low SNR (noise, not speech) with no STT
+        """
         logger.warning(f"NC timeout triggered: {reason}")
         if self._session and not self._is_paused:
             await self.pause_session(self._session, reason)
 
     async def setup_session_monitor(self):
-        """Initialize and start the session monitor with VAD bridge."""
+        """
+        Initialize and start the session monitor with VAD bridge.
+
+        NOTE: Both NC manager and session monitor track similar metrics.
+        NC manager uses SNR-based detection, session monitor uses pattern-based.
+        They complement each other for robust detection.
+        """
         config = SessionMonitorConfig(
             silence_timeout_seconds=Config.SILENCE_TIMEOUT,
             noise_without_stt_timeout_seconds=Config.NOISE_WITHOUT_STT_TIMEOUT,
             continuous_speech_timeout_seconds=Config.CONTINUOUS_SPEECH_TIMEOUT,
             noise_energy_threshold=Config.NOISE_ENERGY_THRESHOLD,
-            agent_speaking_grace_seconds=5.0,
-            post_agent_grace_seconds=3.0,
+            agent_speaking_grace_seconds=8.0,    # Increased
+            post_agent_grace_seconds=5.0,        # After agent stops
             post_stt_grace_seconds=Config.POST_STT_GRACE_SECONDS,
             min_valid_utterance_length=2,
-            max_fragmented_utterances=8,
+            max_fragmented_utterances=10,        # Increased tolerance
             min_pause_interval_seconds=60.0,
         )
 
@@ -198,15 +261,16 @@ class RaahiAssistant(Agent):
         )
 
         await self._session_monitor.start()
-        logger.info("Session monitor and VAD bridge initialized")
+        logger.info(
+            "Session monitor initialized with tolerant settings for noisy environments")
 
     def _on_vad_speech_start(self):
         """Called when VAD detects speech start."""
-        pass
+        logger.debug("VAD: Speech started")
 
     def _on_vad_speech_end(self):
         """Called when VAD detects speech end."""
-        pass
+        logger.debug("VAD: Speech ended")
 
     async def stop_session_monitor(self):
         """Stop the session monitor."""
@@ -215,7 +279,8 @@ class RaahiAssistant(Agent):
 
     async def _on_monitor_pause_triggered(self, reason: PauseReason, message: str):
         """Called when session monitor detects a pause condition."""
-        logger.info(f"Monitor triggered pause: {reason.value} - {message}")
+        logger.info(f"""Session monitor triggered pause: {
+                    reason.value} - {message}""")
 
         if self._session and not self._is_paused:
             await self.pause_session(self._session, reason.value)
@@ -258,8 +323,11 @@ class RaahiAssistant(Agent):
 
         logger.info(f"Session pausing: {reason}")
 
+        # Pause both monitors
         if self._session_monitor:
             self._session_monitor.pause()
+        if self._nc_manager:
+            self._nc_manager.pause()
 
         try:
             session.interrupt()
@@ -267,6 +335,7 @@ class RaahiAssistant(Agent):
         except Exception as e:
             logger.debug(f"No activity to interrupt: {e}")
 
+        # User-friendly pause message
         away_msg = "Maaf kijiyega me kuch samajh nahi paayi"
 
         pause_messages = {
@@ -315,9 +384,13 @@ class RaahiAssistant(Agent):
         self._is_paused = False
         self._pause_reason = None
 
+        # Resume both monitors
         if self._session_monitor:
             self._session_monitor.resume()
             logger.debug("Session monitor resumed")
+        if self._nc_manager:
+            self._nc_manager.resume()
+            logger.debug("NC manager resumed")
 
         await self.send_event(SessionEvent.RESUMED, {
             "trip_info": self.trip_info.model_dump(),
@@ -359,41 +432,61 @@ class RaahiAssistant(Agent):
             await self.ui.send_trip_update(self.trip_info)
 
             await session.generate_reply(
-                instructions=f"""User selected {
-                    selection.value}. Confirm briefly and continue."""
+                instructions=f"User selected {
+                    selection.value}. Confirm briefly and continue."
             )
 
     def on_audio_frame(self, energy: float, is_speech: bool):
-        """Forward audio frame data to session monitor."""
+        """
+        Forward audio frame data to session monitor.
+        Called from VAD bridge with energy calculated from raw audio.
+        """
         if self._session_monitor:
             self._session_monitor.on_audio_frame(energy, is_speech)
 
     def on_stt_result(self, transcript: str, is_final: bool):
-        """Forward STT result to session monitor and NC manager."""
+        """
+        Forward STT result to both session monitor and NC manager.
+
+        CRITICAL: This is how we know conversation is active.
+        Both monitors use this to extend grace periods.
+        """
         if self._session_monitor:
             self._session_monitor.on_stt_result(transcript, is_final)
 
-        # Also notify NC manager of valid STT
-        if self._nc_manager and is_final and transcript:
+        # Notify NC manager of valid STT - prevents false noise flood detection
+        if self._nc_manager and is_final and transcript and len(transcript.strip()) > 1:
             self._nc_manager.on_stt_result(transcript)
+            logger.debug(f"""STT result forwarded to NC manager: '{
+                         transcript[:30]}...'""")
 
     def on_agent_speech_start(self):
-        """Notify session monitor that agent started speaking."""
+        """Notify monitors that agent started speaking."""
         if self._session_monitor:
             self._session_monitor.on_agent_speech_start()
 
     def on_agent_speech_end(self):
-        """Notify session monitor that agent finished speaking."""
+        """Notify monitors that agent finished speaking."""
         if self._session_monitor:
             self._session_monitor.on_agent_speech_end()
 
-        # Also notify NC manager
+        # Notify NC manager - extends grace period
         if self._nc_manager:
             self._nc_manager.on_agent_speech()
 
     async def handle_audio_track(self, track: rtc.Track, participant: rtc.RemoteParticipant):
         """
-        Subscribe to audio track and process frames through noise cancellation.
+        Subscribe to audio track and process frames for analysis.
+
+        IMPORTANT: This processes audio for ANALYSIS ONLY.
+        The processed audio is NOT sent to STT (architecture limitation).
+        We use this for:
+        1. Energy calculation
+        2. SNR estimation
+        3. Noise floor tracking
+        4. Timeout detection
+
+        For actual noise reduction in STT, enable client-side WebRTC noise suppression.
         """
         if track.kind != rtc.TrackKind.KIND_AUDIO:
             return
@@ -401,42 +494,63 @@ class RaahiAssistant(Agent):
         logger.info(f"Processing audio track from {participant.identity}")
 
         audio_stream = rtc.AudioStream(track)
+        self._audio_frame_count = 0
+        self._last_stats_log = 0
 
         try:
             async for frame_event in audio_stream:
+                # Skip processing if paused
                 if self._is_paused:
                     continue
 
                 frame = frame_event.frame
+                self._audio_frame_count += 1
 
                 # Get raw audio data
                 audio_bytes = frame.data.tobytes() if hasattr(
                     frame.data, 'tobytes') else bytes(frame.data)
                 audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
 
-                # Process through noise cancellation
+                # Process through noise cancellation manager for analysis
                 if self._nc_manager:
+                    # process_audio_frame returns (processed_audio, energy)
+                    # processed_audio is for analysis/logging, not sent to STT
                     processed_audio, energy = self._nc_manager.process_audio_frame(
                         audio_data,
                         frame.sample_rate
                     )
 
-                    # Determine if this looks like speech
-                    is_speech = energy > Config.NC_SPEECH_ENERGY_THRESHOLD
+                    # Get SNR-based speech detection from NC manager
+                    stats = self._nc_manager.get_stats()
+                    snr = stats.get('snr', 0)
+                    is_speech = (snr >= Config.NC_MIN_SNR_FOR_SPEECH and
+                                 energy > Config.NC_SPEECH_ENERGY_THRESHOLD)
 
                     # Forward to session monitor
                     self.on_audio_frame(energy, is_speech)
+
+                    # Periodic stats logging (every ~5 seconds)
+                    if self._audio_frame_count - self._last_stats_log >= 500:
+                        self._last_stats_log = self._audio_frame_count
+                        logger.debug(
+                            f"Audio stats: energy={energy:.4f}, "
+                            f"noise_floor={stats.get('noise_floor', 0):.4f}, "
+                            f"SNR={snr:.2f}, is_speech={is_speech}"
+                        )
                 else:
-                    # Fallback: just calculate energy
+                    # Fallback: just calculate energy without NC manager
                     energy = self._energy_calculator.calculate_energy(
                         audio_bytes, sample_width=2)
                     is_speech = energy > Config.NOISE_ENERGY_THRESHOLD
                     self.on_audio_frame(energy, is_speech)
 
+        except asyncio.CancelledError:
+            logger.info("Audio track processing cancelled")
         except Exception as e:
-            logger.error(f"Audio track processing error: {e}")
+            logger.error(f"Audio track processing error: {e}", exc_info=True)
         finally:
-            logger.info("Audio track processing ended")
+            logger.info(f"Audio track processing ended after {
+                        self._audio_frame_count} frames")
 
     async def send_final_trip_event(self, completion_message: str):
         """Send the final createTrip event with complete chat history."""
@@ -590,8 +704,12 @@ async def raahi_agent(ctx: agents.JobContext):
         session_data=session_data,
     )
 
+    # Create AgentSession with optimized settings for noisy environments
     session = AgentSession(
-        stt=google.STT(model=Config.STT_MODEL, languages=Config.STT_LANGUAGE),
+        stt=google.STT(
+            model=Config.STT_MODEL,  # "telephony" - optimized for noisy audio
+            languages=Config.STT_LANGUAGE,
+        ),
         llm=google.LLM(
             model=Config.LLM_MODEL,
             vertexai=True,
@@ -620,8 +738,11 @@ async def raahi_agent(ctx: agents.JobContext):
     assistant.set_session(session)
 
     # Start noise cancellation BEFORE session monitor
+    # NC manager handles audio analysis and SNR-based timeout detection
     await assistant.setup_noise_cancellation()
     await assistant.setup_session_monitor()
+
+    # === Event Handlers ===
 
     @session.on("user_state_changed")
     def on_user_state_changed(event: UserStateChangedEvent):
@@ -632,14 +753,20 @@ async def raahi_agent(ctx: agents.JobContext):
 
     @session.on("user_input_transcribed")
     def on_user_input(event: UserInputTranscribedEvent):
+        """
+        CRITICAL: Forward STT results to monitors.
+        This is how we know the conversation is active.
+        """
         if assistant.is_paused:
             logger.debug("Ignoring STT input - session is paused")
             return
 
+        # Forward to both monitors - this is crucial for timeout detection
         assistant.on_stt_result(event.transcript, event.is_final)
 
         if event.is_final and event.transcript:
             assistant.log_user(event.transcript)
+            logger.info(f"User said: {event.transcript[:50]}...")
 
     @session.on("conversation_item_added")
     def on_conversation_item(event: ConversationItemAddedEvent):
@@ -741,12 +868,18 @@ async def raahi_agent(ctx: agents.JobContext):
         publication: rtc.RemoteTrackPublication,
         participant: rtc.RemoteParticipant
     ):
-        """Handle track subscription - process audio through noise cancellation."""
+        """
+        Handle track subscription - process audio for analysis.
+
+        NOTE: Audio processing here is for analysis/monitoring only.
+        It does NOT affect what STT receives.
+        """
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Audio track subscribed from {participant.identity}")
             asyncio.create_task(
                 assistant.handle_audio_track(track, participant))
 
+    # Start the agent session
     await session.start(
         room=ctx.room,
         agent=assistant,
@@ -757,14 +890,16 @@ async def raahi_agent(ctx: agents.JobContext):
         ),
     )
 
+    # Play greeting
     if not await play_greeting(session, event_id):
         await session.generate_reply(
             instructions="Greet: 'Namaste, mai Raahi hoon. Aap apna pickup aur drop city bataiye.'",
             allow_interruptions=False
         )
 
-    logger.info("Agent session running with noise cancellation enabled...")
+    logger.info("Agent session running with SNR-based noise detection...")
 
+    # Keep session alive
     try:
         while True:
             await asyncio.sleep(1)
