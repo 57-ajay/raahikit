@@ -401,7 +401,7 @@ class RaahiAssistant(Agent):
         try:
             await session.say(
                 text=f"Welcome back! {context}",
-                allow_interruptions=True,
+                allow_interruptions=False,
             )
         except Exception as e:
             logger.error(f"Could not say resume message: {e}", exc_info=True)
@@ -432,8 +432,9 @@ class RaahiAssistant(Agent):
             await self.ui.send_trip_update(self.trip_info)
 
             await session.generate_reply(
-                instructions=f"User selected {
-                    selection.value}. Confirm briefly and continue."
+                instructions=f"""User selected {
+                    selection.value}. Confirm briefly and continue.""",
+                allow_interruptions=False
             )
 
     def on_audio_frame(self, energy: float, is_speech: bool):
@@ -549,8 +550,8 @@ class RaahiAssistant(Agent):
         except Exception as e:
             logger.error(f"Audio track processing error: {e}", exc_info=True)
         finally:
-            logger.info(f"Audio track processing ended after {
-                        self._audio_frame_count} frames")
+            logger.info(f"""Audio track processing ended after {
+                        self._audio_frame_count} frames""")
 
     async def send_final_trip_event(self, completion_message: str):
         """Send the final createTrip event with complete chat history."""
