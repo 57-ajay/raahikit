@@ -25,7 +25,6 @@ from session_monitor import SessionMonitor, SessionMonitorConfig, PauseReason
 from audio_processor import VADEventBridge, AudioEnergyCalculator
 from zoneinfo import ZoneInfo
 
-# Import the IMPROVED noise cancellation module
 from noise_cancellation import (
     NoiseCancellationManager,
     NoiseCancellationConfig,
@@ -60,29 +59,22 @@ class Config:
     CLOSE_ON_DISCONNECT = False
     DELETE_ROOM_ON_CLOSE = False
 
-    # === STT Settings ===
-    # "telephony" model is optimized for noisy/phone-quality audio
     STT_MODEL = "telephony"
     STT_LANGUAGE = "hi-IN"
 
-    # === TTS Settings ===
     TTS_VOICE = "hi-IN-Chirp3-HD-Aoede"
     TTS_LANGUAGE = "hi-IN"
 
-    # === LLM Settings ===
     LLM_MODEL = "gemini-2.5-flash"
     LLM_LOCATION = "asia-south1"
     LLM_PROJECT = "cabswale-ai"
 
-    # === VAD Settings ===
-    # Tuned for noisy environments - slightly more tolerant
     # Increased from 0.25 - needs longer speech to trigger
     VAD_MIN_SPEECH_DURATION = 0.3
     # Increased from 0.6 - more silence to end utterance
     VAD_MIN_SILENCE_DURATION = 0.7
     VAD_ACTIVATION_THRESHOLD = 0.5     # Keep at 0.5 for balanced sensitivity
 
-    # === Session Monitor Settings ===
     # More tolerant to avoid false pauses
     SILENCE_TIMEOUT = 45.0             # Increased from 30 - wait longer before pause
     # Increased from 30 - more tolerance for noisy STT
@@ -143,7 +135,6 @@ class RaahiAssistant(Agent):
         self._nc_manager: Optional[NoiseCancellationManager] = None
         self._audio_processing_task: Optional[asyncio.Task] = None
 
-        # Track audio processing state
         self._audio_frame_count = 0
         self._last_stats_log = 0
 
@@ -187,10 +178,8 @@ class RaahiAssistant(Agent):
             agent_speaking_grace_seconds=Config.NC_AGENT_GRACE_SECONDS,
             post_stt_grace_seconds=Config.NC_POST_STT_GRACE_SECONDS,
             min_snr_for_speech=Config.NC_MIN_SNR_FOR_SPEECH,
-            # Additional tuning
-            # Better for varying noise (traffic, crowd)
             stationary_noise=False,
-            time_constant_s=0.4,     # Fast adaptation to changing noise
+            time_constant_s=0.4,
         )
 
         self._nc_manager = NoiseCancellationManager(
@@ -241,11 +230,11 @@ class RaahiAssistant(Agent):
             noise_without_stt_timeout_seconds=Config.NOISE_WITHOUT_STT_TIMEOUT,
             continuous_speech_timeout_seconds=Config.CONTINUOUS_SPEECH_TIMEOUT,
             noise_energy_threshold=Config.NOISE_ENERGY_THRESHOLD,
-            agent_speaking_grace_seconds=8.0,    # Increased
-            post_agent_grace_seconds=5.0,        # After agent stops
+            agent_speaking_grace_seconds=8.0,
+            post_agent_grace_seconds=5.0,
             post_stt_grace_seconds=Config.POST_STT_GRACE_SECONDS,
             min_valid_utterance_length=2,
-            max_fragmented_utterances=10,        # Increased tolerance
+            max_fragmented_utterances=10,
             min_pause_interval_seconds=60.0,
         )
 
@@ -335,7 +324,6 @@ class RaahiAssistant(Agent):
         except Exception as e:
             logger.debug(f"No activity to interrupt: {e}")
 
-        # User-friendly pause message
         away_msg = "Maaf kijiyega me kuch samajh nahi paayi"
 
         pause_messages = {
@@ -705,10 +693,9 @@ async def raahi_agent(ctx: agents.JobContext):
         session_data=session_data,
     )
 
-    # Create AgentSession with optimized settings for noisy environments
     session = AgentSession(
         stt=google.STT(
-            model=Config.STT_MODEL,  # "telephony" - optimized for noisy audio
+            model=Config.STT_MODEL,
             languages=Config.STT_LANGUAGE,
         ),
         llm=google.LLM(
@@ -738,12 +725,8 @@ async def raahi_agent(ctx: agents.JobContext):
 
     assistant.set_session(session)
 
-    # Start noise cancellation BEFORE session monitor
-    # NC manager handles audio analysis and SNR-based timeout detection
     await assistant.setup_noise_cancellation()
     await assistant.setup_session_monitor()
-
-    # === Event Handlers ===
 
     @session.on("user_state_changed")
     def on_user_state_changed(event: UserStateChangedEvent):
@@ -762,7 +745,6 @@ async def raahi_agent(ctx: agents.JobContext):
             logger.debug("Ignoring STT input - session is paused")
             return
 
-        # Forward to both monitors - this is crucial for timeout detection
         assistant.on_stt_result(event.transcript, event.is_final)
 
         if event.is_final and event.transcript:
@@ -880,7 +862,6 @@ async def raahi_agent(ctx: agents.JobContext):
             asyncio.create_task(
                 assistant.handle_audio_track(track, participant))
 
-    # Start the agent session
     await session.start(
         room=ctx.room,
         agent=assistant,
@@ -891,7 +872,6 @@ async def raahi_agent(ctx: agents.JobContext):
         ),
     )
 
-    # Play greeting
     if not await play_greeting(session, event_id):
         await session.generate_reply(
             instructions="Greet: 'Namaste, mai Raahi hoon. Aap apna pickup aur drop city bataiye.'",
@@ -900,7 +880,6 @@ async def raahi_agent(ctx: agents.JobContext):
 
     logger.info("Agent session running with SNR-based noise detection...")
 
-    # Keep session alive
     try:
         while True:
             await asyncio.sleep(1)
