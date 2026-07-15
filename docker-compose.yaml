@@ -1,20 +1,5 @@
 services:
-  # --- 1. SSL Proxy (Caddy) ---
-  caddy:
-    image: caddy:latest
-    restart: unless-stopped
-    # command: caddy reverse-proxy --from ${DOMAIN_NAME} --to livekit:7880
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
-    environment:
-      - DOMAIN_NAME=${DOMAIN_NAME}
-
-  # --- 2. LiveKit Server ---
+  # --- LiveKit Server ---
   livekit:
     image: livekit/livekit-server:v1.9.10
     restart: unless-stopped
@@ -24,46 +9,58 @@ services:
     ports:
       - "7881:7881"
       - "7882:7882/udp"
-    depends_on:
-      - redis
     environment:
       - LIVEKIT_IP=${PUBLIC_IP}
+    networks:
+      raahi-net:
+        aliases:
+          - raahikit-livekit
+    depends_on:
+      - redis
 
-  # --- 3. Redis ---
+  # --- Redis ---
   redis:
     image: redis/redis-stack:latest
     restart: unless-stopped
     ports:
       - "6379:6379"
       - "8001:8001"
+    networks:
+      raahi-net:
+        aliases:
+          - raahikit-redis
 
-  # --- 4. AI Agent ---
+  # --- AI Agent ---
   agent:
     build: .
     restart: always
     environment:
-      # Connect locally to LiveKit container
-      - LIVEKIT_URL=ws://livekit:7880
-      # INJECT KEYS FROM .ENV
+      - LIVEKIT_URL=ws://raahikit-livekit:7880
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+    networks:
+      raahi-net:
+        aliases:
+          - raahikit-agent
     depends_on:
       - livekit
 
-  # --- 5. Token Server ---
+  # --- Token Server ---
   token-server:
     build: .
     restart: always
     command: uv run uvicorn server:app --host 0.0.0.0 --port 3000
-    # ports:
-    #   - "3000:3000"
     environment:
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=redis://raahikit-redis:6379
+    networks:
+      raahi-net:
+        aliases:
+          - raahikit-token-server
     depends_on:
       - redis
 
-volumes:
-  caddy_data:
-  caddy_config:
+networks:
+  raahi-net:
+    external: true
