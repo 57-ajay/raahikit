@@ -2,8 +2,8 @@ port: 7880
 bind_addresses:
     - ""
 rtc:
-    udp_port: 7882
-    tcp_port: 7881
+    udp_port: 7884
+    tcp_port: 7883
     use_external_ip: true
 
 keys:
@@ -12,9 +12,3 @@ keys:
 logging:
     json: false
     level: info
-
-redis:
-    address: redis:6379
-    username: ""
-    password: ""
-    db: 0
