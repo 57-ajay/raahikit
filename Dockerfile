@@ -24,25 +24,12 @@ ENV OPENBLAS_CORETYPE=Haswell
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock requirements.lock.txt ./
 
-# Install Python dependencies
-RUN uv pip install --system \
-    'livekit-agents[silero,turn-detector]' \
-    livekit-plugins-google \
-    livekit-plugins-silero \
-    python-dotenv \
-    google-genai \
-    redisvl \
-    'fastapi[all]' \
-    # Noise cancellation - try pyrnnoise first, fall back to noisereduce
-    pyrnnoise || echo "pyrnnoise not available"
-
-# Install noisereduce as fallback (lighter weight, still effective)
-RUN uv pip install --system \
-    noisereduce \
-    scipy \
-    numpy
+# Install Python dependencies pinned to production versions (reproducible build).
+# Previously these were installed unpinned, which silently pulled newer
+# livekit-agents on each rebuild and broke the app against API changes.
+RUN uv pip install --system -r requirements.lock.txt
 
 COPY ./AUDIO_DIR ./AUDIO_DIR
 COPY main.py server.py prompt.py schemas.py \
